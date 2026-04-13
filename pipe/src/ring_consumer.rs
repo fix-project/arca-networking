@@ -1,16 +1,9 @@
 use crate::error::PipeError;
 use crate::ring_header::RingHeader;
 use crate::traits;
+use core::sync::atomic::Ordering;
 
 /// Consumer (read) end of a single SPSC ring buffer.
-///
-/// Reads bytes from the ring and advances `read_cursor`.
-/// Uses `Acquire` ordering on `write_cursor` loads to pair with
-/// the producer's `Release` store — ensuring written bytes are visible.
-///
-/// Stores to `read_cursor` use `Relaxed` ordering — a stale read by the
-/// producer only causes it to conservatively see less free space, which is
-/// still correct.
 pub struct RingConsumer<'a> {
     header: &'a RingHeader,
     data: *const u8,
@@ -18,33 +11,90 @@ pub struct RingConsumer<'a> {
 }
 
 impl<'a> RingConsumer<'a> {
-    /// Create a new consumer from a ring header and data region.
-    ///
     /// # Safety
     /// - `data` must point to a valid, readable region of `ring_size` bytes.
-    /// - The memory must remain valid for the lifetime `'a`.
-    /// - There must be at most one `RingConsumer` for a given ring.
+    /// - The memory must remain valid for `'a`.
+    /// - At most one `RingConsumer` per ring.
     pub unsafe fn new(header: &'a RingHeader, data: *const u8, ring_size: u64) -> Self {
-        Self {
-            header,
-            data,
-            ring_size,
-        }
+        Self { header, data, ring_size }
     }
 }
 
 impl<'a> traits::Read for RingConsumer<'a> {
-    fn read(&mut self, _buf: &mut [u8]) -> Result<usize, PipeError> {
-        // TODO: Implement read logic
-        //
-        // 1. Load write_cursor (Acquire) and read_cursor (Acquire)
-        // 2. Calculate available data: write_cursor - read_cursor
-        // 3. If available == 0, return Err(WouldBlock)
-        // 4. Calculate how many bytes to read: min(buf.len(), available)
-        // 5. Calculate physical read position: read_cursor % ring_size
-        // 6. Handle wrap-around with two copy_nonoverlapping calls if needed
-        // 7. Release fence, then store new read_cursor with Relaxed ordering
-        // 8. Return Ok(bytes_read)
-        todo!()
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, PipeError> {
+        let used = self.header.used_space();
+        if used == 0 {
+            return Err(PipeError::WouldBlock);
+        }
+
+        let n = core::cmp::min(buf.len() as u64, used) as usize;
+        let read_cursor = self.header.read_cursor.load(Ordering::Relaxed);
+        let offset = (read_cursor % self.ring_size) as usize;
+        let ring_size = self.ring_size as usize;
+
+        let first = core::cmp::min(n, ring_size - offset);
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.data.add(offset), buf.as_mut_ptr(), first);
+            if n > first {
+                core::ptr::copy_nonoverlapping(self.data, buf.as_mut_ptr().add(first), n - first);
+            }
+        }
+
+        self.header.read_cursor.store(read_cursor + n as u64, Ordering::Release);
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::Read;
+    use core::sync::atomic::AtomicU64;
+
+    fn header(read: u64, write: u64) -> RingHeader {
+        RingHeader {
+            read_cursor: AtomicU64::new(read),
+            write_cursor: AtomicU64::new(write),
+        }
+    }
+
+    #[test]
+    fn simple_read() {
+        let data = *b"hello...";
+        let h = header(0, 5);
+        let mut c = unsafe { RingConsumer::new(&h, data.as_ptr(), 8) };
+        let mut out = [0u8; 8];
+        assert_eq!(c.read(&mut out).unwrap(), 5);
+        assert_eq!(&out[..5], b"hello");
+        assert_eq!(h.read_cursor.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn partial_read() {
+        let data = *b"abcdefgh";
+        let h = header(0, 8);
+        let mut c = unsafe { RingConsumer::new(&h, data.as_ptr(), 8) };
+        let mut out = [0u8; 3];
+        assert_eq!(c.read(&mut out).unwrap(), 3);
+        assert_eq!(&out, b"abc");
+    }
+
+    #[test]
+    fn wrap_around() {
+        let data = *b"WXYZabcd";
+        let h = header(5, 12);
+        let mut c = unsafe { RingConsumer::new(&h, data.as_ptr(), 8) };
+        let mut out = [0u8; 8];
+        assert_eq!(c.read(&mut out).unwrap(), 7);
+        assert_eq!(&out[..7], b"bcdWXYZ");
+    }
+
+    #[test]
+    fn empty_ring_blocks() {
+        let data = [0u8; 4];
+        let h = header(4, 4);
+        let mut c = unsafe { RingConsumer::new(&h, data.as_ptr(), 4) };
+        let mut out = [0u8; 4];
+        assert!(matches!(c.read(&mut out), Err(PipeError::WouldBlock)));
     }
 }
