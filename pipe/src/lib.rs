@@ -13,7 +13,7 @@
 
 mod error;
 mod traits;
-mod ring_header;
+mod ring;
 mod ring_producer;
 mod ring_consumer;
 mod shared_memory_region;
@@ -21,7 +21,7 @@ mod bidirectional_pipe;
 
 pub use error::PipeError;
 pub use traits::{Read, Write};
-pub use ring_header::RingHeader;
+pub use ring::{RingData, RingHeader};
 pub use ring_producer::RingProducer;
 pub use ring_consumer::RingConsumer;
 pub use shared_memory_region::SharedMemoryRegion;
