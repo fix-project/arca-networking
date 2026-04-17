@@ -25,6 +25,9 @@ impl<'a> traits::Read for RingConsumer<'a> {
         let n = core::cmp::min(buf.len() as u64, used) as usize;
         let cursor = self.header.read_cursor.load(Ordering::Relaxed);
         self.data.read_at(cursor, &mut buf[..n]);
+
+        // No standalone fence needed, release on the store guarantees the
+        // preceding read_at is visible before the cursor update
         self.header.read_cursor.store(cursor + n as u64, Ordering::Release);
         Ok(n)
     }

@@ -15,6 +15,10 @@ impl RingHeader {
     pub fn used_space(&self) -> u64 {
         let write = self.write_cursor.load(Ordering::Acquire);
         let read = self.read_cursor.load(Ordering::Relaxed);
+
+        // Cursors are monotonically increasing and never reset, but they can
+        // overflow u64. wrapping_sub gives the correct delta regardless, 
+        // also avoids panic on debug-mode subtraction overflow
         write.wrapping_sub(read)
     }
 
@@ -22,6 +26,8 @@ impl RingHeader {
     pub fn free_space(&self, capacity: u64) -> u64 {
         let write = self.write_cursor.load(Ordering::Relaxed);
         let read = self.read_cursor.load(Ordering::Acquire);
+
+        // See used_space — wrapping_sub handles cursor overflow correctly
         capacity - write.wrapping_sub(read)
     }
 }

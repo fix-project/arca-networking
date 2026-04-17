@@ -25,6 +25,9 @@ impl<'a> traits::Write for RingProducer<'a> {
         let n = core::cmp::min(buf.len() as u64, free) as usize;
         let cursor = self.header.write_cursor.load(Ordering::Relaxed);
         self.data.write_at(cursor, &buf[..n]);
+
+        // No standalone fence needed, release on the store guarantees the
+        // preceding write_at is visible before the cursor update
         self.header.write_cursor.store(cursor + n as u64, Ordering::Release);
         Ok(n)
     }
