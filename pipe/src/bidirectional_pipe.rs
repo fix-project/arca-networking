@@ -34,8 +34,15 @@ impl<'a> BidirectionalPipe<'a> {
     /// created per region.
     pub fn new(region: &'a SharedMemoryRegion, ring_size: u64, side: Side) -> Self {
         assert!(region.len() >= Self::required_size(ring_size));
+        assert!(ring_size % core::mem::align_of::<RingHeader>() as u64 == 0,
+            "ring_size must be a multiple of 8 for header alignment");
         let base = region.as_ptr();
+        assert!(base.align_offset(core::mem::align_of::<RingHeader>()) == 0,
+            "shared memory region must be 8-byte aligned");
 
+        // Layout: [HeaderA (16)] [DataA (ring_size)] [HeaderB (16)] [DataB (ring_size)]
+        // Interleaved so each header is adjacent to its data (cache locality)
+        // and headers are separated by ring_size (avoids false sharing).
         let header_a = unsafe { &*(base as *const RingHeader) };
         let data_a = unsafe { base.add(HEADER_SIZE as usize) };
         let header_b = unsafe { &*(data_a.add(ring_size as usize) as *const RingHeader) };
@@ -78,23 +85,28 @@ mod tests {
     use super::*;
     use crate::traits::{Read, Write};
 
+    #[repr(align(8))]
+    struct Aligned<const N: usize>([u8; N]);
+
+    macro_rules! pipe_pair {
+        ($ring:expr, $mem:ident, $a:ident, $b:ident) => {
+            let mut $mem = Aligned([0u8; 2 * (16 + $ring)]);
+            let region = unsafe {
+                SharedMemoryRegion::from_raw($mem.0.as_mut_ptr(), $mem.0.len() as u64)
+            };
+            let mut $a = BidirectionalPipe::new(&region, $ring, Side::A);
+            let mut $b = BidirectionalPipe::new(&region, $ring, Side::B);
+        };
+    }
+
     #[test]
     fn required_size_matches_layout() {
-        let size = BidirectionalPipe::required_size(64);
-        assert_eq!(size, 2 * (16 + 64));
+        assert_eq!(BidirectionalPipe::required_size(64), 2 * (16 + 64));
     }
 
     #[test]
     fn round_trip_a_to_b() {
-        const RING: u64 = 64;
-        let size = BidirectionalPipe::required_size(RING) as usize;
-        let mut mem = [0u8; 2 * (16 + 64)];
-        assert_eq!(mem.len(), size);
-
-        let region = unsafe { SharedMemoryRegion::from_raw(mem.as_mut_ptr(), size as u64) };
-        let mut a = BidirectionalPipe::new(&region, RING, Side::A);
-        let mut b = BidirectionalPipe::new(&region, RING, Side::B);
-
+        pipe_pair!(64, mem, a, b);
         assert_eq!(a.write(b"ping").unwrap(), 4);
         let mut out = [0u8; 4];
         assert_eq!(b.read(&mut out).unwrap(), 4);
@@ -103,13 +115,7 @@ mod tests {
 
     #[test]
     fn round_trip_b_to_a() {
-        const RING: u64 = 32;
-        let size = BidirectionalPipe::required_size(RING) as usize;
-        let mut mem = [0u8; 2 * (16 + 32)];
-        let region = unsafe { SharedMemoryRegion::from_raw(mem.as_mut_ptr(), size as u64) };
-        let mut a = BidirectionalPipe::new(&region, RING, Side::A);
-        let mut b = BidirectionalPipe::new(&region, RING, Side::B);
-
+        pipe_pair!(32, mem, a, b);
         assert_eq!(b.write(b"pong!!").unwrap(), 6);
         let mut out = [0u8; 6];
         assert_eq!(a.read(&mut out).unwrap(), 6);
@@ -118,13 +124,7 @@ mod tests {
 
     #[test]
     fn both_directions_independent() {
-        const RING: u64 = 32;
-        let size = BidirectionalPipe::required_size(RING) as usize;
-        let mut mem = [0u8; 2 * (16 + 32)];
-        let region = unsafe { SharedMemoryRegion::from_raw(mem.as_mut_ptr(), size as u64) };
-        let mut a = BidirectionalPipe::new(&region, RING, Side::A);
-        let mut b = BidirectionalPipe::new(&region, RING, Side::B);
-
+        pipe_pair!(32, mem, a, b);
         a.write(b"hello").unwrap();
         b.write(b"world").unwrap();
 
@@ -134,5 +134,44 @@ mod tests {
         a.read(&mut from_b).unwrap();
         assert_eq!(&from_a, b"hello");
         assert_eq!(&from_b, b"world");
+    }
+
+    #[test]
+    fn multi_lap() {
+        pipe_pair!(8, mem, a, b);
+        for i in 0u8..20 {
+            assert_eq!(a.write(&[i]).unwrap(), 1);
+            let mut out = [0u8; 1];
+            assert_eq!(b.read(&mut out).unwrap(), 1);
+            assert_eq!(out[0], i);
+        }
+    }
+
+    #[test]
+    fn fill_drain_refill() {
+        pipe_pair!(8, mem, a, b);
+        assert_eq!(a.write(b"12345678").unwrap(), 8);
+        let mut out = [0u8; 8];
+        assert_eq!(b.read(&mut out).unwrap(), 8);
+        assert_eq!(&out, b"12345678");
+
+        assert_eq!(a.write(b"abcdefgh").unwrap(), 8);
+        assert_eq!(b.read(&mut out).unwrap(), 8);
+        assert_eq!(&out, b"abcdefgh");
+    }
+
+    #[test]
+    fn interleaved_both_directions() {
+        pipe_pair!(16, mem, a, b);
+        a.write(b"aa").unwrap();
+        b.write(b"bb").unwrap();
+        a.write(b"cc").unwrap();
+        b.write(b"dd").unwrap();
+
+        let mut out = [0u8; 4];
+        b.read(&mut out).unwrap();
+        assert_eq!(&out, b"aacc");
+        a.read(&mut out).unwrap();
+        assert_eq!(&out, b"bbdd");
     }
 }

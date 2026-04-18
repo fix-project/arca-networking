@@ -17,6 +17,7 @@ impl<'a> RingConsumer<'a> {
 
 impl<'a> traits::Read for RingConsumer<'a> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, PipeError> {
+        if buf.is_empty() { return Ok(0); }
         let used = self.header.used_space();
         if used == 0 {
             return Err(PipeError::WouldBlock);
@@ -89,4 +90,27 @@ mod tests {
         let mut out = [0u8; 4];
         assert!(matches!(c.read(&mut out), Err(PipeError::WouldBlock)));
     }
+
+    #[test]
+    fn zero_length_read_non_empty() {
+        let mut mem = *b"data";
+        let h = header(0, 4);
+        let data = unsafe { RingData::new(mem.as_mut_ptr(), 4) };
+        let mut c = RingConsumer::new(&h, data);
+        let mut out = [0u8; 0];
+        assert_eq!(c.read(&mut out).unwrap(), 0);
+        assert_eq!(h.read_cursor.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn zero_length_read_empty() {
+        let mut mem = [0u8; 4];
+        let h = header(0, 0);
+        let data = unsafe { RingData::new(mem.as_mut_ptr(), 4) };
+        let mut c = RingConsumer::new(&h, data);
+        let mut out = [0u8; 0];
+        assert_eq!(c.read(&mut out).unwrap(), 0);
+    }
+
+
 }

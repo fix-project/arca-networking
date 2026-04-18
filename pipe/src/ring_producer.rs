@@ -17,6 +17,7 @@ impl<'a> RingProducer<'a> {
 
 impl<'a> traits::Write for RingProducer<'a> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, PipeError> {
+        if buf.is_empty() { return Ok(0); }
         let free = self.header.free_space(self.data.size());
         if free == 0 {
             return Err(PipeError::WouldBlock);
@@ -89,4 +90,26 @@ mod tests {
         let mut p = RingProducer::new(&h, data);
         assert!(matches!(p.write(b"x"), Err(PipeError::WouldBlock)));
     }
+
+    #[test]
+    fn zero_length_write_non_full() {
+        let h = header();
+        let mut mem = [0u8; 8];
+        let data = unsafe { RingData::new(mem.as_mut_ptr(), 8) };
+        let mut p = RingProducer::new(&h, data);
+        assert_eq!(p.write(b"").unwrap(), 0);
+        assert_eq!(h.write_cursor.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn zero_length_write_full() {
+        let h = header();
+        h.write_cursor.store(8, Ordering::Relaxed);
+        let mut mem = [0u8; 8];
+        let data = unsafe { RingData::new(mem.as_mut_ptr(), 8) };
+        let mut p = RingProducer::new(&h, data);
+        assert_eq!(p.write(b"").unwrap(), 0);
+    }
+
+
 }
