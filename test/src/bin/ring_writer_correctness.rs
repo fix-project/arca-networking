@@ -43,6 +43,9 @@ fn main() {
     // Safety: fd is valid and points to `required` zero-initialised bytes.
     let mut mmap = unsafe { MmapMut::map_mut(&fd).expect("mmap failed") };
 
+    // Zero out to clear any stale cursor state if shm name was reused.
+    mmap.fill(0);
+
     let region = unsafe { SharedMemoryRegion::from_raw(mmap.as_mut_ptr(), required as u64) };
     let mut pipe = BidirectionalPipe::new(&region, RING_SIZE, Side::A);
 
