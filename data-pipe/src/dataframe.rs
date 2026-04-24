@@ -38,3 +38,37 @@ impl DataFrameHeader {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_type_from_u32_round_trip() {
+        assert_eq!(FrameType::from_u32(FrameType::Data as u32), Some(FrameType::Data));
+        assert_eq!(FrameType::from_u32(FrameType::Fin  as u32), Some(FrameType::Fin));
+        assert_eq!(FrameType::from_u32(FrameType::Rst  as u32), Some(FrameType::Rst));
+    }
+
+    #[test]
+    fn frame_type_from_u32_unknown() {
+        assert_eq!(FrameType::from_u32(3), None);
+        assert_eq!(FrameType::from_u32(u32::MAX), None);
+    }
+
+    #[test]
+    fn data_frame_header_as_bytes_is_8_bytes() {
+        let h = DataFrameHeader::new(FrameType::Data, 0);
+        assert_eq!(h.as_bytes().len(), 8);
+    }
+
+    #[test]
+    fn data_frame_header_as_bytes_encodes_fields() {
+        let h = DataFrameHeader::new(FrameType::Fin, 1234);
+        let bytes = h.as_bytes();
+        let raw_type = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let payload_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(FrameType::from_u32(raw_type), Some(FrameType::Fin));
+        assert_eq!(payload_len, 1234);
+    }
+}
