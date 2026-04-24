@@ -64,13 +64,20 @@ impl<'a> AsyncStream<'a> {
         }
     }
 
-    pub async fn shutdown(&mut self) -> Result<(), StreamError> {
+    pub async fn shutdown(&mut self) {
         if self.write_closed {
-            return Ok(());
+            return;
         }
         write_all(&mut self.pipe, DataFrameHeader::new(FrameType::Fin, 0).as_bytes()).await;
         self.write_closed = true;
-        Ok(())
+    }
+
+    pub async fn send_rst(&mut self) {
+        if !self.write_closed {
+            write_all(&mut self.pipe, DataFrameHeader::new(FrameType::Rst, 0).as_bytes()).await;
+            self.write_closed = true;
+        }
+        self.read_closed = true;
     }
 
     pub fn is_closed(&self) -> bool {
