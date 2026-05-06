@@ -1,22 +1,62 @@
-//! Protocol types and payload encodings for control messages.
+//! Wire protocol for the **single control pipe** between Arca and the Linux monitor.
 //!
-//! Single-byte message kinds plus small fixed payload structs.
+//! Every control message is a [`ControlFrame`]: a fixed 7-byte header followed
+//! by a small payload. The format is intentionally tiny and field-positional
+//! so it's easy to read on the wire when debugging.
+//!
+//! ```text
+//! offset  size  field
+//! ------  ----  -----------------------------------------
+//!  0      1     message_type (u8, see MessageType)
+//!  1      2     payload_len  (u16 little-endian, bytes)
+//!  3      4     request_id   (u32 little-endian)
+//!  7      ..    payload      (payload_len bytes)
+//! ```
+//!
+//! Payloads themselves are also fixed-layout little-endian structs. They
+//! never contain pointers or string lengths — just numeric fields and IPv4
+//! address octets — so an engineer staring at a hex dump can read them.
+//!
+//! The frame is the *only* thing that flows across the control pipe. Per-
+//! connection bytestreams flow on **separate** shared-memory data pipes,
+//! whose location is communicated to Arca via [`DataPipeInfo`] inside the
+//! `ConnectOk` / `IncomingConnection` payloads.
+
 use arca_pipe::BidirectionalPipe;
 
+/// Maximum payload bytes after the 7-byte header.
+///
+/// Sized comfortably above today's largest payload (`ConnectionReady`, 20 B)
+/// so we have headroom to add fields without bumping a version byte.
 pub const MAX_FRAME_PAYLOAD: usize = 256;
 
-/// Minimal set of message kinds for current scope.
+/// Catalog of message kinds carried on the control pipe.
+///
+/// Keep this list **small** and add new variants only when there's a real
+/// need. Each variant is a single byte on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MessageType {
+    /// Arca → Linux: please `bind`+`listen` on the given [`Endpoint`].
     ListenRequest = 1,
+    /// Linux → Arca: listener is ready; payload is [`ListenerReady`].
     ListenOk = 2,
+    /// Arca → Linux: please `connect` outbound to the given [`Endpoint`].
     ConnectRequest = 3,
+    /// Linux → Arca: outbound connect succeeded; payload is [`ConnectionReady`].
     ConnectOk = 4,
+    /// Linux → Arca (unsolicited): a peer just connected to one of our
+    /// listeners; payload is [`ConnectionReady`] with `listener_id` set.
     IncomingConnection = 5,
+    /// Linux → Arca: bind/listen failed; payload is [`ErrPayload`].
+    ListenErr = 6,
+    /// Linux → Arca: outbound connect failed; payload is [`ErrPayload`].
+    ConnectErr = 7,
 }
 
 impl MessageType {
+    /// Reverse of `as u8`, returning `None` for unknown bytes so the codec
+    /// can reject garbage instead of silently misinterpreting it.
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             1 => Some(Self::ListenRequest),
@@ -24,16 +64,18 @@ impl MessageType {
             3 => Some(Self::ConnectRequest),
             4 => Some(Self::ConnectOk),
             5 => Some(Self::IncomingConnection),
+            6 => Some(Self::ListenErr),
+            7 => Some(Self::ConnectErr),
             _ => None,
         }
     }
 }
 
-/// Wire frame:
-/// - byte 0: message type
-/// - bytes 1..3: payload length (u16 LE)
-/// - bytes 3..7: request_id (u32 LE)
-/// - bytes 7..: payload bytes
+/// One control message in memory (header + inline payload buffer).
+///
+/// The `payload` array is fixed-size so `ControlFrame` is `Copy` and lives
+/// happily in `no_std`. Only the first `payload_len` bytes are valid; use
+/// [`ControlFrame::payload`] to get the live slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlFrame {
     pub message_type: MessageType,
@@ -43,6 +85,10 @@ pub struct ControlFrame {
 }
 
 impl ControlFrame {
+    /// Build a frame, copying `payload` into the inline buffer.
+    ///
+    /// Panics if `payload.len() > MAX_FRAME_PAYLOAD`. Callers always own the
+    /// payload, so this is a programming bug, not a runtime input error.
     pub fn new(message_type: MessageType, request_id: u32, payload: &[u8]) -> Self {
         assert!(payload.len() <= MAX_FRAME_PAYLOAD, "payload too large");
 
@@ -56,14 +102,18 @@ impl ControlFrame {
         out
     }
 
+    /// The valid prefix of `self.payload`.
     pub fn payload(&self) -> &[u8] {
         &self.payload[..self.payload_len as usize]
     }
 }
 
+/// IPv4 host + port. Six bytes on the wire: 4 octets then `port` LE.
+///
+/// IPv6 isn't modeled yet; when we need it we'll add a sibling type or a
+/// length-prefixed address field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Endpoint {
-    /// IPv4 address as 4 octets
     pub host: [u8; 4],
     pub port: u16,
 }
@@ -73,8 +123,8 @@ impl Endpoint {
         Self { host, port }
     }
 
+    /// Encode into the start of `out`; returns bytes written (always 6).
     pub fn encode(&self, out: &mut [u8; MAX_FRAME_PAYLOAD]) -> usize {
-        // Payload layout: [ipv4: 4 bytes][port: u16 LE]
         out[..4].copy_from_slice(&self.host);
         out[4..6].copy_from_slice(&self.port.to_le_bytes());
         6
@@ -88,6 +138,7 @@ impl Endpoint {
     }
 }
 
+/// Payload of [`MessageType::ListenOk`]. Just the listener handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListenerReady {
     pub listener_id: u32,
@@ -106,16 +157,38 @@ impl ListenerReady {
     }
 }
 
-/// Pipe metadata needed by Arca to attach to a newly created data pipe.
+/// Payload of [`MessageType::ListenErr`] / [`MessageType::ConnectErr`].
 ///
-/// On the wire we only send `pipe_id` and `ring_size`. Total shared memory
-/// size matches [`BidirectionalPipe::required_size`] — derive it instead of
-/// duplicating another `u64` in the message.
+/// `code` is the Linux `errno` when available, else `1` for "unknown".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrPayload {
+    pub code: u32,
+}
+
+impl ErrPayload {
+    pub fn encode(&self, out: &mut [u8; 4]) {
+        out.copy_from_slice(&self.code.to_le_bytes());
+    }
+
+    pub fn decode(payload: &[u8]) -> Self {
+        assert!(payload.len() == 4, "err payload must be 4 bytes");
+        Self {
+            code: u32::from_le_bytes(payload[0..4].try_into().unwrap()),
+        }
+    }
+}
+
+/// How Arca finds the per-connection data pipe.
+///
+/// Layout on the wire (12 bytes): `pipe_id` (u32 LE) then `ring_size` (u64 LE).
+/// Total shared-memory size for the `BidirectionalPipe` is derived from
+/// `ring_size`; we don't ship a redundant `len` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataPipeInfo {
-    /// Opaque pipe id/handle understood by both sides.
+    /// Opaque handle agreed by both sides (e.g., index into a SHM table).
     pub pipe_id: u32,
-    /// Ring capacity in bytes for each direction (A->B and B->A), same as `BidirectionalPipe::new`.
+    /// Per-direction ring capacity in bytes (same value passed to
+    /// [`BidirectionalPipe::new`]).
     pub ring_size: u64,
 }
 
@@ -124,11 +197,11 @@ impl DataPipeInfo {
         Self { pipe_id, ring_size }
     }
 
+    /// Total shared-memory bytes the receiver must map for this pipe.
     pub fn shm_len(self) -> u64 {
         BidirectionalPipe::required_size(self.ring_size)
     }
 
-    /// Fixed layout: `pipe_id` (4) then `ring_size` (8), little-endian.
     pub fn encode(&self, out: &mut [u8; 12]) {
         out[..4].copy_from_slice(&self.pipe_id.to_le_bytes());
         out[4..12].copy_from_slice(&self.ring_size.to_le_bytes());
@@ -143,14 +216,12 @@ impl DataPipeInfo {
     }
 }
 
-/// Unified payload for "connection established and data pipe ready".
+/// Payload of both [`MessageType::ConnectOk`] (outbound) and
+/// [`MessageType::IncomingConnection`] (inbound). Same fields, same layout —
+/// the message kind is what tells you which is which.
 ///
-/// Use this for:
-/// - `ConnectOk` (outbound connection succeeded)
-/// - `IncomingConnection` (inbound connection accepted)
-///
-/// `listener_id` is the listener that accepted the connection, or `0` when the
-/// connection is outbound and there is no listener.
+/// `listener_id == 0` means "outbound connection, no listener was involved".
+/// Real listeners always get `listener_id >= 1` from the monitor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionReady {
     pub listener_id: u32,
@@ -183,17 +254,32 @@ mod tests {
 
     #[test]
     fn message_type_from_u8_round_trip() {
-        assert_eq!(MessageType::from_u8(MessageType::ListenRequest as u8), Some(MessageType::ListenRequest));
-        assert_eq!(MessageType::from_u8(MessageType::ListenOk as u8), Some(MessageType::ListenOk));
-        assert_eq!(MessageType::from_u8(MessageType::ConnectRequest as u8), Some(MessageType::ConnectRequest));
-        assert_eq!(MessageType::from_u8(MessageType::ConnectOk as u8), Some(MessageType::ConnectOk));
-        assert_eq!(MessageType::from_u8(MessageType::IncomingConnection as u8), Some(MessageType::IncomingConnection));
+        for mt in [
+            MessageType::ListenRequest,
+            MessageType::ListenOk,
+            MessageType::ConnectRequest,
+            MessageType::ConnectOk,
+            MessageType::IncomingConnection,
+            MessageType::ListenErr,
+            MessageType::ConnectErr,
+        ] {
+            assert_eq!(MessageType::from_u8(mt as u8), Some(mt));
+        }
     }
 
     #[test]
     fn message_type_from_u8_unknown() {
         assert_eq!(MessageType::from_u8(0), None);
-        assert_eq!(MessageType::from_u8(6), None);
+        assert_eq!(MessageType::from_u8(8), None);
+        assert_eq!(MessageType::from_u8(255), None);
+    }
+
+    #[test]
+    fn err_payload_round_trip() {
+        let e = ErrPayload { code: 42 };
+        let mut b = [0u8; 4];
+        e.encode(&mut b);
+        assert_eq!(ErrPayload::decode(&b), e);
     }
 
     #[test]

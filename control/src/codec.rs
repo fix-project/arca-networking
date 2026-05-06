@@ -9,23 +9,34 @@ use crate::{ControlFrame, MessageType, MAX_FRAME_PAYLOAD};
 /// `message_type` (1) + `payload_len` (2) + `request_id` (4).
 pub const HEADER_LEN: usize = 7;
 
-pub fn write_frame<T: Write>(transport: &mut T, frame: &ControlFrame) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecError {
+    UnknownMessageType(u8),
+    PayloadTooLarge { len: usize },
+    Closed,
+}
+
+pub fn write_frame<T: Write>(transport: &mut T, frame: &ControlFrame) -> Result<(), CodecError> {
     let mut header = [0u8; HEADER_LEN];
     header[0] = frame.message_type as u8;
     header[1..3].copy_from_slice(&frame.payload_len.to_le_bytes());
     header[3..7].copy_from_slice(&frame.request_id.to_le_bytes());
 
-    write_all(transport, &header);
-    write_all(transport, frame.payload());
+    write_all(transport, &header)?;
+    write_all(transport, frame.payload())?;
+    Ok(())
 }
 
-pub fn read_frame<T: Read>(transport: &mut T) -> ControlFrame {
+pub fn read_frame<T: Read>(transport: &mut T) -> Result<ControlFrame, CodecError> {
     let mut header = [0u8; HEADER_LEN];
-    read_exact(transport, &mut header);
+    read_exact(transport, &mut header)?;
 
-    let message_type = MessageType::from_u8(header[0]).expect("unknown message type");
+    let message_type =
+        MessageType::from_u8(header[0]).ok_or(CodecError::UnknownMessageType(header[0]))?;
     let payload_len = u16::from_le_bytes([header[1], header[2]]) as usize;
-    assert!(payload_len <= MAX_FRAME_PAYLOAD, "payload_len too large");
+    if payload_len > MAX_FRAME_PAYLOAD {
+        return Err(CodecError::PayloadTooLarge { len: payload_len });
+    }
 
     let request_id = u32::from_le_bytes([header[3], header[4], header[5], header[6]]);
 
@@ -35,28 +46,30 @@ pub fn read_frame<T: Read>(transport: &mut T) -> ControlFrame {
         payload_len: payload_len as u16,
         payload: [0u8; MAX_FRAME_PAYLOAD],
     };
-    read_exact(transport, &mut frame.payload[..payload_len]);
-    frame
+    read_exact(transport, &mut frame.payload[..payload_len])?;
+    Ok(frame)
 }
 
-fn write_all<T: Write>(transport: &mut T, mut src: &[u8]) {
+fn write_all<T: Write>(transport: &mut T, mut src: &[u8]) -> Result<(), CodecError> {
     while !src.is_empty() {
         match transport.write(src) {
-            Ok(0) => panic!("write returned 0"),
+            Ok(0) => return Err(CodecError::Closed),
             Ok(n) => src = &src[n..],
             Err(PipeError::WouldBlock) => {}
         }
     }
+    Ok(())
 }
 
-fn read_exact<T: Read>(transport: &mut T, mut dst: &mut [u8]) {
+fn read_exact<T: Read>(transport: &mut T, mut dst: &mut [u8]) -> Result<(), CodecError> {
     while !dst.is_empty() {
         match transport.read(dst) {
-            Ok(0) => panic!("read returned 0"),
+            Ok(0) => return Err(CodecError::Closed),
             Ok(n) => dst = &mut dst[n..],
             Err(PipeError::WouldBlock) => {}
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -66,7 +79,6 @@ mod tests {
         ConnectionReady, DataPipeInfo, Endpoint, ListenerReady, MessageType, MAX_FRAME_PAYLOAD,
     };
 
-    /// In-memory bytes for tests: `write` appends, `read` consumes from the front.
     struct MemPipe<const N: usize> {
         buf: [u8; N],
         len: usize,
@@ -109,9 +121,9 @@ mod tests {
     fn write_read_round_trip_empty_payload() {
         let mut pipe = MemPipe::<256>::new();
         let frame = ControlFrame::new(MessageType::ListenRequest, 7, &[]);
-        write_frame(&mut pipe, &frame);
+        write_frame(&mut pipe, &frame).unwrap();
 
-        let got = read_frame(&mut pipe);
+        let got = read_frame(&mut pipe).unwrap();
         assert_eq!(got.message_type, MessageType::ListenRequest);
         assert_eq!(got.request_id, 7);
         assert_eq!(got.payload_len, 0);
@@ -125,8 +137,8 @@ mod tests {
         let frame = ControlFrame::new(MessageType::ConnectRequest, 99, &pl[..n]);
 
         let mut pipe = MemPipe::<256>::new();
-        write_frame(&mut pipe, &frame);
-        let got = read_frame(&mut pipe);
+        write_frame(&mut pipe, &frame).unwrap();
+        let got = read_frame(&mut pipe).unwrap();
 
         assert_eq!(got.message_type, MessageType::ConnectRequest);
         assert_eq!(got.request_id, 99);
@@ -144,8 +156,8 @@ mod tests {
         let frame = ControlFrame::new(MessageType::ListenOk, 1, &pl);
 
         let mut pipe = MemPipe::<128>::new();
-        write_frame(&mut pipe, &frame);
-        let got = read_frame(&mut pipe);
+        write_frame(&mut pipe, &frame).unwrap();
+        let got = read_frame(&mut pipe).unwrap();
         assert_eq!(got.message_type, MessageType::ListenOk);
         assert_eq!(ListenerReady::decode(got.payload()).listener_id, lr.listener_id);
     }
@@ -162,8 +174,8 @@ mod tests {
         let frame = ControlFrame::new(MessageType::ConnectOk, 100, &pl);
 
         let mut pipe = MemPipe::<256>::new();
-        write_frame(&mut pipe, &frame);
-        let got = read_frame(&mut pipe);
+        write_frame(&mut pipe, &frame).unwrap();
+        let got = read_frame(&mut pipe).unwrap();
         assert_eq!(ConnectionReady::decode(got.payload()), ready);
     }
 
@@ -172,14 +184,14 @@ mod tests {
         let mut pipe = MemPipe::<1024>::new();
         let a = ControlFrame::new(MessageType::ListenRequest, 1, &[1, 2, 3]);
         let b = ControlFrame::new(MessageType::ConnectRequest, 2, &[]);
-        write_frame(&mut pipe, &a);
-        write_frame(&mut pipe, &b);
+        write_frame(&mut pipe, &a).unwrap();
+        write_frame(&mut pipe, &b).unwrap();
 
-        let got_a = read_frame(&mut pipe);
+        let got_a = read_frame(&mut pipe).unwrap();
         assert_eq!(got_a.request_id, 1);
         assert_eq!(got_a.payload(), &[1, 2, 3]);
 
-        let got_b = read_frame(&mut pipe);
+        let got_b = read_frame(&mut pipe).unwrap();
         assert_eq!(got_b.message_type, MessageType::ConnectRequest);
         assert_eq!(got_b.request_id, 2);
         assert_eq!(got_b.payload_len, 0);
@@ -191,9 +203,21 @@ mod tests {
         let frame = ControlFrame::new(MessageType::IncomingConnection, 0x1234_5678, &payload);
 
         let mut pipe = MemPipe::<{ HEADER_LEN + MAX_FRAME_PAYLOAD + 32 }>::new();
-        write_frame(&mut pipe, &frame);
-        let got = read_frame(&mut pipe);
+        write_frame(&mut pipe, &frame).unwrap();
+        let got = read_frame(&mut pipe).unwrap();
         assert_eq!(got.payload_len as usize, MAX_FRAME_PAYLOAD);
         assert_eq!(got.payload(), payload.as_slice());
+    }
+
+    #[test]
+    fn read_unknown_message_type() {
+        let mut pipe = MemPipe::<32>::new();
+        let mut header = [0u8; HEADER_LEN];
+        header[0] = 99;
+        header[1..3].copy_from_slice(&0u16.to_le_bytes());
+        header[3..7].copy_from_slice(&1u32.to_le_bytes());
+        pipe.write(&header).unwrap();
+        let err = read_frame(&mut pipe).unwrap_err();
+        assert_eq!(err, CodecError::UnknownMessageType(99));
     }
 }
