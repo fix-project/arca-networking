@@ -47,16 +47,85 @@ which is two single-producer/single-consumer rings packed into one shared
 memory region. The pipe layer is a raw byte stream — **no framing**. Higher
 layers add their own framing.
 
-| Pipe | Lifetime | Carries |
-|------|----------|---------|
-| **Control pipe** | Static (1 per Arca instance) | Framed control messages (this doc). |
-| **Data pipe** | Dynamic (1 per session) | Raw application bytes for one TCP session. |
+| Pipe | Lifetime | Created by | Carries |
+|------|----------|------------|---------|
+| **Control pipe** | Static (1 per Arca instance) | Bootstrap (out of scope) | Framed control messages (this doc). |
+| **Data pipe** | Dynamic (1 per session) | Monitor, on demand | Raw application bytes for one TCP session. |
 
-Where does the SHM region come from? Out of scope for this doc — assume both
-sides have a way to map the same physical memory (hypervisor mapping, POSIX
-`shm_open`, etc.). The control pipe ships a `DataPipeInfo { pipe_id,
-ring_size }` to Arca; both sides interpret `pipe_id` against an agreed-upon
-table to find the right region.
+The control pipe is assumed to exist before any frame on it is sent — both
+Arca and the monitor know about its SHM region at boot. *Data* pipes are
+the ones the protocol actually creates and tears down at runtime, so they
+deserve a precise lifecycle.
+
+### Data-pipe lifecycle
+
+A new data pipe is needed at exactly **two moments** — and these are
+exactly the two moments the monitor is about to send a `ConnectionReady`
+payload:
+
+- *Outbound*: a `ConnectRequest` succeeded. The kernel handshake is done
+  and the monitor is about to reply with `ConnectOk`.
+- *Inbound*: a non-blocking `accept` on a live listener returned a fresh
+  socket. The monitor is about to push an `IncomingConnection` event.
+
+In both cases the lifecycle is the same five steps:
+
+```
+1. Trigger    Monitor decides a new session needs a pipe (one of the two
+              moments above).
+
+2. Allocate   Monitor:
+                 • picks a connection_id        (monotonic, §6)
+                 • picks a pipe_id              (today: == connection_id)
+                 • allocates an SHM region of
+                   BidirectionalPipe::required_size(ring_size) bytes
+                 • registers (pipe_id → region) in the SHM table
+              No bytes are written into the rings yet.
+
+3. Inform     Monitor encodes the just-allocated handles into a
+              ConnectionReady{ listener_id, connection_id, pipe }
+              and ships it inside ConnectOk (outbound) or
+              IncomingConnection (inbound).
+
+4. Attach     Arca decodes ConnectionReady, looks up pipe_id in the same
+              SHM table, and constructs its half of the pipe:
+                BidirectionalPipe::new(region, ring_size, Side::A)
+              The monitor's I/O thread already holds Side::B.
+
+5. Pump       The data-protocol layer (Luna) starts moving bytes between
+              the rings and the kernel TcpStream. The control protocol's
+              job for this session is done until teardown.
+```
+
+**Ordering matters.** The SHM region must be allocated and registered
+**before** the `ConnectionReady` frame is written. Otherwise Arca can
+decode the payload, look up `pipe_id`, and find nothing — or worse, find
+a stale region. The current single-threaded monitor enforces this
+naturally (allocate → encode → write happen in that order on one stack).
+A future multi-threaded monitor must keep the same happens-before edge.
+
+**How Arca resolves `pipe_id` to a real SHM region** is intentionally not
+specified by the protocol. Both sides share an external registry — an
+SHM name table, a hypervisor handle table, whatever the platform offers —
+keyed by `pipe_id`. The protocol just gives each region a stable name.
+
+### Teardown
+
+Currently undefined — see §9. When a session ends, nothing reclaims the
+SHM region. Real production needs `CloseRequest{conn_id}` /
+`PeerClosed{conn_id}` plus a "release `pipe_id`" step on both sides;
+until those land, sessions leak.
+
+### Status of the current implementation
+
+Step 2 (Allocate) is **stubbed**. `Monitor::dispatch_request` and
+`Monitor::poll_incoming` stamp
+`DataPipeInfo::new(connection_id, default_ring_size)` into the reply
+without actually allocating an SHM region; `pipe_id` is just
+`connection_id` as a placeholder. Step 4 (Attach) is part of the
+data-protocol layer (Luna) and isn't exercised by the control crate's
+tests yet. Once a real SHM allocator lands, `pipe_id` becomes a separate
+namespace from `connection_id`; nothing else on the wire changes.
 
 ---
 
@@ -145,15 +214,19 @@ The total shared-memory size for this pipe is
     │  ConnectRequest{rid=N, ep}            │
     ├──────────────────────────────────────►│  TcpStream::connect(ep)
     │                                       │  (kernel handshake)
+    │                                       │  allocate connection_id
+    │                                       │  allocate SHM region, pick pipe_id   ← data pipe born here (§2)
     │  ConnectOk{rid=N, ConnectionReady}    │
     │◄──────────────────────────────────────┤
+    │  attach to SHM via pipe_id            │
+    │   (Side::A)                           │   (monitor already holds Side::B)
     │                                       │
     ▼                                       ▼
   ArcaTcpStream                       monitor.connection(id) is live
 ```
 
 If `connect` fails the monitor replies with `ConnectErr{rid=N, errno}` and
-no connection is allocated.
+no connection or SHM region is allocated.
 
 ### Listen + accept (inbound)
 
@@ -162,16 +235,18 @@ no connection is allocated.
     │  ListenRequest{rid=N, ep}             │
     ├──────────────────────────────────────►│  TcpListener::bind(ep)
     │                                       │  set_nonblocking(true)
-    │  ListenOk{rid=N, listener_id=L}       │
-    │◄──────────────────────────────────────┤
+    │  ListenOk{rid=N, listener_id=L}       │   (no data pipe yet — listeners
+    │◄──────────────────────────────────────┤    don't carry application bytes)
     │                                       │
     │   ───────── time passes ─────────     │
     │                                       │   loop: poll_incoming()
     │                                       │     listener.accept() -> stream
     │                                       │     allocate connection_id
+    │                                       │     allocate SHM region, pick pipe_id  ← data pipe born here (§2)
     │  IncomingConnection{rid=0,            │
     │      listener_id=L, conn_id=C, pipe}  │
     │◄──────────────────────────────────────┤
+    │  attach to SHM via pipe_id (Side::A)  │
     │                                       │
     ▼                                       ▼
    accept(&listener) returns ArcaTcpStream
