@@ -7,6 +7,7 @@ use crate::dataframe::{DataFrameHeader, FrameType};
 pub enum StreamError {
     WriteClosed,
     ConnectionReset,
+    MessageTooLarge,
 }
 
 pub struct AsyncStream<'a> {
@@ -14,16 +15,23 @@ pub struct AsyncStream<'a> {
     pipe: BidirectionalPipe<'a>,
     write_closed: bool,
     read_closed: bool,
+    current_frame_remaining: u32,
 }
 
 impl<'a> AsyncStream<'a> {
     pub fn from_pipe(conn_id: u32, pipe: BidirectionalPipe<'a>) -> Self {
-        Self { conn_id, pipe, write_closed: false, read_closed: false }
+        Self { conn_id, pipe, write_closed: false, read_closed: false, current_frame_remaining: 0 }
     }
 
     pub async fn send(&mut self, buf: &[u8]) -> Result<usize, StreamError> {
         if self.write_closed {
             return Err(StreamError::WriteClosed);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if buf.len() > u32::MAX as usize {
+            return Err(StreamError::MessageTooLarge);
         }
         let header = DataFrameHeader::new(FrameType::Data, buf.len() as u32);
         write_all(&mut self.pipe, header.as_bytes()).await;
@@ -35,33 +43,39 @@ impl<'a> AsyncStream<'a> {
         if self.read_closed {
             return Ok(0);
         }
-        let mut header_bytes = [0u8; core::mem::size_of::<DataFrameHeader>()];
-        read_exact(&mut self.pipe, &mut header_bytes).await;
-        let frame_type = FrameType::from_u32(u32::from_le_bytes(header_bytes[0..4].try_into().unwrap()));
-        let payload_len = u32::from_le_bytes(header_bytes[4..8].try_into().unwrap());
 
-        match frame_type {
-            None => {
-                self.read_closed = true;
-                write_all(&mut self.pipe, DataFrameHeader::new(FrameType::Rst, 0).as_bytes()).await;
-                self.write_closed = true;
-                Err(StreamError::ConnectionReset)
-            }
-            Some(FrameType::Data) => {
-                let len = payload_len as usize;
-                read_exact(&mut self.pipe, &mut buf[..len]).await;
-                Ok(len)
-            }
-            Some(FrameType::Fin) => {
-                self.read_closed = true;
-                Ok(0)
-            }
-            Some(FrameType::Rst) => {
-                self.read_closed = true;
-                self.write_closed = true;
-                Err(StreamError::ConnectionReset)
+        if self.current_frame_remaining == 0 {
+            let mut header_bytes = [0u8; core::mem::size_of::<DataFrameHeader>()];
+            read_exact(&mut self.pipe, &mut header_bytes).await;
+            let frame_type = FrameType::from_u32(u32::from_le_bytes(header_bytes[0..4].try_into().unwrap()));
+            let payload_len = u32::from_le_bytes(header_bytes[4..8].try_into().unwrap());
+
+            match frame_type {
+                None => {
+                    self.read_closed = true;
+                    write_all(&mut self.pipe, DataFrameHeader::new(FrameType::Rst, 0).as_bytes()).await;
+                    self.write_closed = true;
+                    return Err(StreamError::ConnectionReset);
+                }
+                Some(FrameType::Fin) => {
+                    self.read_closed = true;
+                    return Ok(0);
+                }
+                Some(FrameType::Rst) => {
+                    self.read_closed = true;
+                    self.write_closed = true;
+                    return Err(StreamError::ConnectionReset);
+                }
+                Some(FrameType::Data) => {
+                    self.current_frame_remaining = payload_len;
+                }
             }
         }
+
+        let to_read = (self.current_frame_remaining as usize).min(buf.len());
+        read_exact(&mut self.pipe, &mut buf[..to_read]).await;
+        self.current_frame_remaining -= to_read as u32;
+        Ok(to_read)
     }
 
     pub async fn shutdown(&mut self) {

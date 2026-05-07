@@ -5,6 +5,7 @@ use crate::dataframe::{DataFrameHeader, FrameType};
 pub enum StreamError {
     WriteClosed,
     ConnectionReset,
+    MessageTooLarge,
 }
 
 pub struct SyncStream<'a> {
@@ -12,16 +13,23 @@ pub struct SyncStream<'a> {
     pipe: BidirectionalPipe<'a>,
     write_closed: bool,
     read_closed: bool,
+    current_frame_remaining: u32,
 }
 
 impl<'a> SyncStream<'a> {
     pub fn from_pipe(conn_id: u32, pipe: BidirectionalPipe<'a>) -> Self {
-        Self { conn_id, pipe, write_closed: false, read_closed: false }
+        Self { conn_id, pipe, write_closed: false, read_closed: false, current_frame_remaining: 0 }
     }
 
     pub fn send(&mut self, buf: &[u8]) -> Result<usize, StreamError> {
         if self.write_closed {
             return Err(StreamError::WriteClosed);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if buf.len() > u32::MAX as usize {
+            return Err(StreamError::MessageTooLarge);
         }
         write_all(&mut self.pipe, DataFrameHeader::new(FrameType::Data, buf.len() as u32).as_bytes());
         write_all(&mut self.pipe, buf);
@@ -32,32 +40,39 @@ impl<'a> SyncStream<'a> {
         if self.read_closed {
             return Ok(0);
         }
-        let mut header_bytes = [0u8; core::mem::size_of::<DataFrameHeader>()];
-        read_exact(&mut self.pipe, &mut header_bytes);
-        let frame_type = FrameType::from_u32(u32::from_le_bytes(header_bytes[0..4].try_into().unwrap()));
-        let payload_len = u32::from_le_bytes(header_bytes[4..8].try_into().unwrap());
 
-        match frame_type {
-            None => {
-                self.read_closed = true;
-                write_all(&mut self.pipe, DataFrameHeader::new(FrameType::Rst, 0).as_bytes());
-                self.write_closed = true;
-                Err(StreamError::ConnectionReset)
-            }
-            Some(FrameType::Data) => {
-                read_exact(&mut self.pipe, &mut buf[..payload_len as usize]);
-                Ok(payload_len as usize)
-            }
-            Some(FrameType::Fin) => {
-                self.read_closed = true;
-                Ok(0)
-            }
-            Some(FrameType::Rst) => {
-                self.read_closed = true;
-                self.write_closed = true;
-                Err(StreamError::ConnectionReset)
+        if self.current_frame_remaining == 0 {
+            let mut header_bytes = [0u8; core::mem::size_of::<DataFrameHeader>()];
+            read_exact(&mut self.pipe, &mut header_bytes);
+            let frame_type = FrameType::from_u32(u32::from_le_bytes(header_bytes[0..4].try_into().unwrap()));
+            let payload_len = u32::from_le_bytes(header_bytes[4..8].try_into().unwrap());
+
+            match frame_type {
+                None => {
+                    self.read_closed = true;
+                    write_all(&mut self.pipe, DataFrameHeader::new(FrameType::Rst, 0).as_bytes());
+                    self.write_closed = true;
+                    return Err(StreamError::ConnectionReset);
+                }
+                Some(FrameType::Fin) => {
+                    self.read_closed = true;
+                    return Ok(0);
+                }
+                Some(FrameType::Rst) => {
+                    self.read_closed = true;
+                    self.write_closed = true;
+                    return Err(StreamError::ConnectionReset);
+                }
+                Some(FrameType::Data) => {
+                    self.current_frame_remaining = payload_len;
+                }
             }
         }
+
+        let to_read = (self.current_frame_remaining as usize).min(buf.len());
+        read_exact(&mut self.pipe, &mut buf[..to_read]);
+        self.current_frame_remaining -= to_read as u32;
+        Ok(to_read)
     }
 
     pub fn shutdown(&mut self) {
@@ -181,6 +196,18 @@ mod tests {
         b.shutdown();
         a.recv(&mut buf).unwrap();
         assert!(a.is_closed());
+    }
+
+    #[test]
+    fn recv_partial_read() {
+        stream_pair!(128, mem, a, b);
+        assert_eq!(a.send(b"hello").unwrap(), 5);
+        let mut buf = [0u8; 3];
+        assert_eq!(b.recv(&mut buf).unwrap(), 3);
+        assert_eq!(&buf, b"hel");
+        let mut buf2 = [0u8; 3];
+        assert_eq!(b.recv(&mut buf2).unwrap(), 2);
+        assert_eq!(&buf2[..2], b"lo");
     }
 
     #[test]
