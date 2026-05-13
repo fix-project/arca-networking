@@ -1,34 +1,46 @@
 # Arca ↔ Linux Control Protocol
 
-This is the design doc for the **control protocol** that lets Arca ask Linux
-to do TCP-like things (`connect`, `listen`, `accept`) without Arca having to
-implement TCP itself.
+This doc specifies the **control protocol**: framed messages on one
+**control pipe** between Arca and a **monitor** in Linux so Arca can call
+`connect`, `listen`, and `accept` without implementing TCP. It defines the
+wire format, message types, identifiers, data-pipe lifecycle at session
+setup, and how `arca-control` (Arca) and `arca-monitor` (Linux) implement
+the exchange.
 
-It pairs with two sibling pieces of work:
+All Linux→Arca control traffic is **replies**: each frame echoes Arca’s
+`request_id`. Bind/listen uses `ListenRequest` and `ListenOk` or `ListenErr`.
+Outbound connect uses `ConnectRequest` and `ConnectOk` or `ConnectErr`; the
+monitor waits on `TcpStream::connect` until the handshake completes.
+Inbound connections use `AcceptRequest` (message type 8): Arca waits for
+`IncomingConnection`, which is sent **only** in reply to that request with
+the same `request_id`. The monitor keeps a pending-accept queue per
+listener, calls kernel `accept` only when a wait exists, and drives the pipe
+with `poll_accepts`, `pump_once`, `serve_one`, and `FrameReadBuf` when the
+transport is non-blocking. `ArcaSession` matches replies by `request_id`
+only (no secondary stash for out-of-order events).
 
-| Piece | Owner | Crate | What it does |
-|------|-------|-------|--------------|
-| **Bidirectional pipe** | Greg | `arca-pipe` | Lock-free SPSC ring buffers in shared memory. Provides `Read` + `Write` byte streams. The transport everything else rides on. |
-| **Control protocol** *(this doc)* | Majd | `arca-control` (no_std) + `arca-monitor` (std) | Single shared "control pipe" carrying request/reply messages for session management. |
-| **Data protocol** | Luna | (TBD) | Per-connection bytestream wrapper that feels like `std::net::TcpStream`. Sits on top of a per-session bidirectional pipe; the monitor pumps bytes between that pipe and the kernel socket. |
+Related pieces in the stack:
+
+| Piece               | Crate                                       | Role                                                                 |
+| ------------------- | ------------------------------------------- | -------------------------------------------------------------------- |
+| Bidirectional pipe  | `arca-pipe`                                 | Shared-memory rings; `Read` + `Write` byte streams.                 |
+| Control protocol    | `arca-control`, `arca-monitor` *(this doc)* | Framed messages on one control pipe for listen, connect, accept.     |
+| Data path           | *(not this doc)*                            | Per-session byte stream on a bidirectional pipe; monitor relays I/O. |
 
 ---
 
 ## 1. Mental model
 
 ```
-                             ┌─────────────────────────────────────┐
-                             │           Linux user-space          │
-   ┌────────────┐            │                                     │
-   │            │ ─control──►│  Monitor (arca-monitor)             │
-   │            │            │   • single I/O thread               │
-   │            │ ◄──reply───│   • owns kernel TcpListeners        │
-   │   Arca     │            │   • owns kernel TcpStreams          │
-   │ (no_std)   │            │                                     │
-   │            │ ◄──data────│           ↕                         │
-   │            │   …per     │  Linux kernel networking stack       │
-   │            │ ──conn.───►│                                     │
-   └────────────┘            └─────────────────────────────────────┘
+                         ┌────────────────────────────────────┐
+                         │       Linux user-space             │
+   ┌────────────┐        │                                    │
+   │            │control │  Monitor (arca-monitor)            │
+   │            ├───────►│  owns listeners / TCP streams      │
+   │   Arca     │◄──────┤                                    │
+   │ (no_std)   │ reply │             ↕                      │
+   │            │ data  │  Linux kernel networking           │
+   └────────────┘        └────────────────────────────────────┘
 ```
 
 - **Arca never speaks TCP.** It calls `bind` / `connect` / `accept` on the
@@ -47,10 +59,10 @@ which is two single-producer/single-consumer rings packed into one shared
 memory region. The pipe layer is a raw byte stream — **no framing**. Higher
 layers add their own framing.
 
-| Pipe | Lifetime | Created by | Carries |
-|------|----------|------------|---------|
-| **Control pipe** | Static (1 per Arca instance) | Bootstrap (out of scope) | Framed control messages (this doc). |
-| **Data pipe** | Dynamic (1 per session) | Monitor, on demand | Raw application bytes for one TCP session. |
+| Pipe           | Lifetime                       | Created by               | Carries                                   |
+| -------------- | ------------------------------ | ------------------------ | ----------------------------------------- |
+| Control pipe   | Static (1 per Arca instance)   | Bootstrap (out of scope) | Framed control messages (this doc).      |
+| Data pipe      | Dynamic (1 per session)        | Monitor, on demand       | Raw application bytes for one TCP session. |
 
 The control pipe is assumed to exist before any frame on it is sent — both
 Arca and the monitor know about its SHM region at boot. *Data* pipes are
@@ -65,8 +77,11 @@ payload:
 
 - *Outbound*: a `ConnectRequest` succeeded. The kernel handshake is done
   and the monitor is about to reply with `ConnectOk`.
-- *Inbound*: a non-blocking `accept` on a live listener returned a fresh
-  socket. The monitor is about to push an `IncomingConnection` event.
+- *Inbound*: Arca has sent `AcceptRequest` for a listener, the monitor has
+  queued that wait, and a non-blocking kernel `accept` on that listener
+  returned a fresh socket. The monitor is about to reply with
+  `IncomingConnection` carrying the same `request_id` as that
+  `AcceptRequest`.
 
 In both cases the lifecycle is the same five steps:
 
@@ -85,16 +100,17 @@ In both cases the lifecycle is the same five steps:
 3. Inform     Monitor encodes the just-allocated handles into a
               ConnectionReady{ listener_id, connection_id, pipe }
               and ships it inside ConnectOk (outbound) or
-              IncomingConnection (inbound).
+              IncomingConnection (inbound), always echoing Arca's `request_id`
+              on those replies.
 
 4. Attach     Arca decodes ConnectionReady, looks up pipe_id in the same
               SHM table, and constructs its half of the pipe:
                 BidirectionalPipe::new(region, ring_size, Side::A)
               The monitor's I/O thread already holds Side::B.
 
-5. Pump       The data-protocol layer (Luna) starts moving bytes between
-              the rings and the kernel TcpStream. The control protocol's
-              job for this session is done until teardown.
+5. Pump       Per-session data path: move bytes between the rings and the
+              kernel `TcpStream`. The control protocol's job for this session
+              is done until teardown.
 ```
 
 **Ordering matters.** The SHM region must be allocated and registered
@@ -118,14 +134,8 @@ until those land, sessions leak.
 
 ### Status of the current implementation
 
-Step 2 (Allocate) is **stubbed**. `Monitor::dispatch_request` and
-`Monitor::poll_incoming` stamp
-`DataPipeInfo::new(connection_id, default_ring_size)` into the reply
-without actually allocating an SHM region; `pipe_id` is just
-`connection_id` as a placeholder. Step 4 (Attach) is part of the
-data-protocol layer (Luna) and isn't exercised by the control crate's
-tests yet. Once a real SHM allocator lands, `pipe_id` becomes a separate
-namespace from `connection_id`; nothing else on the wire changes.
+Step 2 (Allocate) is **stubbed**: `Monitor::dispatch_request` and
+`Monitor::poll_accepts` write `DataPipeInfo::new(connection_id, default_ring_size)` into the reply without allocating SHM; `pipe_id` is just `connection_id` as a placeholder. Step 4 (Attach) is part of the data-protocol layer and is not exercised by the control crate’s tests yet. Once a real SHM allocator exists, `pipe_id` can diverge from `connection_id`; nothing else on the wire changes for that alone.
 
 ---
 
@@ -146,8 +156,10 @@ offset  size  field
 - **`message_type`** — single byte, one of the variants in the catalog.
 - **`payload_len`** — caps at `MAX_FRAME_PAYLOAD` (currently 256). Any frame
   with a larger length is rejected as malformed.
-- **`request_id`** — Arca-assigned for requests; copied back in the reply.
-  `0` is reserved for unsolicited Linux→Arca events (`IncomingConnection`).
+- **`request_id`** — Arca-assigned for **every** Arca→Linux request
+  (including `AcceptRequest`); Linux echoes the same value on the matching
+  reply. There are no Linux-initiated control frames: everything the monitor
+  writes on the Arca→Linux ring is a **response** to something Arca asked.
 
 The framing is intentionally tiny so a hex dump on the pipe is human
 readable. We don't have a magic byte or version field yet — when we add
@@ -158,15 +170,16 @@ new message type or an extra header byte.
 
 ## 4. Message catalog
 
-| Code | Name | Direction | Payload | Notes |
-|------|------|-----------|---------|-------|
-| 1 | `ListenRequest` | Arca → Linux | `Endpoint` (6 B) | "Bind+listen on this address." |
-| 2 | `ListenOk` | Linux → Arca | `ListenerReady` (4 B) | Reply to `ListenRequest`. |
-| 3 | `ConnectRequest` | Arca → Linux | `Endpoint` (6 B) | "Connect outbound to this address." |
-| 4 | `ConnectOk` | Linux → Arca | `ConnectionReady` (20 B) | Reply to `ConnectRequest`. `listener_id == 0`. |
-| 5 | `IncomingConnection` | Linux → Arca | `ConnectionReady` (20 B) | **Unsolicited.** A peer connected to one of our listeners. `request_id == 0`. |
-| 6 | `ListenErr` | Linux → Arca | `ErrPayload` (4 B) | Reply to `ListenRequest`; `code` is the `errno` if available. |
-| 7 | `ConnectErr` | Linux → Arca | `ErrPayload` (4 B) | Reply to `ConnectRequest`; `code` is the `errno` if available. |
+| Code | Name                 | Direction   | Payload                 | Notes |
+| ---- | -------------------- | ----------- | ----------------------- | ----- |
+| 1    | `ListenRequest`      | Arca → Linux | `Endpoint` (6 B)      | Bind and listen. |
+| 2    | `ListenOk`           | Linux → Arca | `ListenerReady` (4 B) | Reply to `ListenRequest`. |
+| 3    | `ConnectRequest`     | Arca → Linux | `Endpoint` (6 B)      | Outbound connect. |
+| 4    | `ConnectOk`          | Linux → Arca | `ConnectionReady` (20 B) | Reply to `ConnectRequest`. `listener_id == 0`. |
+| 5    | `IncomingConnection` | Linux → Arca | `ConnectionReady` (20 B) | Reply to `AcceptRequest`. `listener_id != 0`. Same `request_id` as the wait. |
+| 6    | `ListenErr`          | Linux → Arca | `ErrPayload` (4 B)    | Reply to `ListenRequest`. |
+| 7    | `ConnectErr`         | Linux → Arca | `ErrPayload` (4 B)    | Reply to `ConnectRequest`. |
+| 8    | `AcceptRequest`      | Arca → Linux | `AcceptListenerId` (4 B) | Wait for next inbound on this `listener_id` (see §5). |
 
 ### Payload layouts
 
@@ -181,6 +194,11 @@ All fields little-endian, fixed offsets, no padding.
 **`ListenerReady` (4 B)**
 ```
 0..4   listener_id  (u32, allocated by the monitor)
+```
+
+**`AcceptListenerId` (4 B)**
+```
+0..4   listener_id  (u32, must be a live listener from `ListenOk`)
 ```
 
 **`ErrPayload` (4 B)**
@@ -238,13 +256,14 @@ no connection or SHM region is allocated.
     │  ListenOk{rid=N, listener_id=L}       │   (no data pipe yet — listeners
     │◄──────────────────────────────────────┤    don't carry application bytes)
     │                                       │
-    │   ───────── time passes ─────────     │
-    │                                       │   loop: poll_incoming()
-    │                                       │     listener.accept() -> stream
-    │                                       │     allocate connection_id
-    │                                       │     allocate SHM region, pick pipe_id  ← data pipe born here (§2)
-    │  IncomingConnection{rid=0,            │
-    │      listener_id=L, conn_id=C, pipe}  │
+    │  AcceptRequest{rid=M, listener L}     │   enqueue (L, M); accept waits
+    ├──────────────────────────────────────►│   until a kernel accept pairs it
+    │                                       │
+    │   ───────── time passes ─────────     │   poll_accepts(): non-blocking
+    │                                       │   accept(); on success → reply
+    │                                       │   allocate connection_id, SHM…  ← data pipe born here (§2)
+    │  IncomingConnection{rid=M,            │
+    │      listener_id=L, conn_id=C, pipe}    │
     │◄──────────────────────────────────────┤
     │  attach to SHM via pipe_id (Side::A)  │
     │                                       │
@@ -252,15 +271,21 @@ no connection or SHM region is allocated.
    accept(&listener) returns ArcaTcpStream
 ```
 
-A few subtleties worth stating clearly:
+Subtleties:
 
-- `IncomingConnection` is **unsolicited** — Arca didn't issue a request, so
-  it carries `request_id == 0`. Correlation is by `listener_id` instead.
-- The monitor's `accept` runs in non-blocking mode inside a single I/O
-  thread (`poll_incoming`); Arca doesn't need to poll itself.
-- If an `IncomingConnection` arrives while Arca is mid-request-reply on
-  some other operation, the Arca-side library **stashes it** in a tiny
-  fixed-size queue and delivers it on a later `accept` call. See §7.
+- **Listen** returns immediately (`ListenOk` / `ListenErr`).
+- **Connect** (`ConnectRequest`) blocks in the monitor until the kernel
+  connect completes — *connect waits*.
+- **Accept** (`AcceptRequest`) blocks on the Arca side until the matching
+  `IncomingConnection` reply arrives; the monitor does **not** perform a
+  kernel `accept` unless there is a pending `request_id` for that listener
+  (so stray inbound TCP connections are not turned into sessions with no
+  Arca wait).
+- The monitor services the control pipe with **`poll_accepts`**
+  (try kernel `accept` for each listener that has a FIFO of pending Arca
+  waits) plus **`pump_once` / `serve_one`** (read Arca→Linux frames with a
+  small incremental decoder on **non-blocking** transports). `serve_one`
+  yields the CPU while waiting for a full frame.
 
 ---
 
@@ -270,60 +295,58 @@ There are **four** numbers in a typical frame, and they're easy to mix up
 because three of them look like little integers and they often appear in
 the same payload. Each one answers a different question.
 
-| Number | Lives in | Answers the question | Allocated by |
-|--------|----------|----------------------|--------------|
-| `message_type` | header byte 0 | *What kind of operation is this frame?* (e.g., "a connect request", "an incoming connection event") | Fixed by the protocol — values `1..=7`. |
-| `request_id` | header bytes 3..7 | *Which Arca→Linux conversation does this frame belong to?* | Arca, before it sends a request. Linux echoes it on the reply. |
-| `listener_id` | payload | *Which specific kernel `TcpListener`?* | Monitor, on `bind`. |
-| `connection_id` | payload | *Which specific live TCP session?* | Monitor, on connect or accept. |
+| Number          | Lives in         | Meaning                                      | Allocated by                          |
+| --------------- | ---------------- | -------------------------------------------- | ------------------------------------- |
+| `message_type`  | header byte 0    | What kind of frame (see catalog).            | Protocol (`1`–`8`).                   |
+| `request_id`    | header bytes 3–7 | Which request–reply pair (Arca sets).        | Arca; echoed on replies.              |
+| `listener_id`   | payload          | Which `TcpListener`.                    | Monitor on bind.                      |
+| `connection_id` | payload          | Which live TCP session.                 | Monitor on connect or accept.         |
 
 The first one says **what** we're doing. The other three say **which thing**
 we're doing it to / about. `message_type` is the same byte for every
 `ListenRequest` Arca ever sends (always `1`); the others are fresh per
 listener / per connection / per conversation.
 
-### "Solicited" vs "unsolicited"
+### Correlation
 
-- **Solicited frame**: a reply to a request Arca made. The reply's
-  `request_id` is copied verbatim from the request, so Arca can tell which
-  question this frame is answering. Examples: `ListenOk`, `ConnectOk`,
-  `ListenErr`, `ConnectErr`.
-- **Unsolicited frame**: Linux talking first. Arca didn't ask. The only
-  one today is `IncomingConnection` — a peer just opened a TCP connection
-  to one of our listeners. There's no matching request, so we set
-  `request_id = 0` as a flag meaning "this is an event, not a reply."
-  Correlation is by `listener_id` instead.
+Every Linux→Arca control frame is a **reply**: its `request_id` copies the
+Arca-issued token from the matching request (`ListenRequest`,
+`ConnectRequest`, or `AcceptRequest`). There is no parallel “event” channel
+and **no stash** on the Arca library side — `IncomingConnection` is not
+delivered ahead of an `AcceptRequest`.
 
 ### Worked example: full lifecycle of one listener with one inbound peer
 
-```
+Inbound:
+
+```text
 Arca → Linux:  ListenRequest   rid=42   payload: 0.0.0.0:8080
 Linux → Arca:  ListenOk        rid=42   payload: listener_id=1
-                                ^^^^^^ same as request — "this is the reply to 42"
+
+Arca → Linux:  AcceptRequest   rid=50   payload: listener_id=1
 
    ... time passes, someone opens a TCP socket to port 8080 ...
 
-Linux → Arca:  IncomingConnection  rid=0   payload: listener_id=1, connection_id=7, pipe…
-                                   ^^^^^ "no question being answered" — it's an event
-                                         listener_id=1  → "for the listener you bound"
-                                         connection_id=7 → "the new session is named 7"
+Linux → Arca:  IncomingConnection  rid=50   payload: listener_id=1, connection_id=7, pipe…
+              (rid matches AcceptRequest)
 ```
 
-And the outbound case:
+Outbound:
 
-```
+```text
 Arca → Linux:  ConnectRequest  rid=43   payload: 8.8.8.8:443
 Linux → Arca:  ConnectOk       rid=43   payload: listener_id=0, connection_id=8, pipe…
-                                                       ^ 0 means "no listener, this was outbound"
+                                listener_id 0 = outbound connect (no listener)
 ```
 
-### Reserved values
+### Reserved values (partial)
 
-| ID | Reserved value | Meaning |
-|----|----------------|---------|
-| `request_id` | `0` | This frame is an unsolicited event, not a reply. |
-| `listener_id` | `0` | "No listener" — used inside `ConnectOk` payloads since outbound `connect` has no associated listener. |
-| `connection_id` | `0` | Unused; reserved as a "no connection" sentinel for future error/teardown payloads. |
+| Field           | Reserved | Meaning |
+| --------------- | -------- | ------- |
+| `listener_id`   | `0`      | No listener — used in `ConnectOk` for outbound connects. |
+| `connection_id` | `0`      | Reserved for future “no connection” / error payloads.   |
+
+`request_id == 0` is not used by the protocol today (Arca allocates monotonically from `1`). It remains available as a sentinel if we add monitor-pushed exceptions later.
 
 `pipe_id` (inside `DataPipeInfo`) is currently always equal to
 `connection_id`. They're separate fields so we can decouple them later
@@ -336,95 +359,42 @@ listeners/connections (out of scope for the current iteration — see §9).
 
 ---
 
-## 7. Correlation, in-flight ops, and the event stash
+## 7. Multiple Arca threads, ordering, and waiting on the ring
 
-The control pipe carries **two kinds of traffic on one byte stream**:
+The Linux→Arca direction of the control pipe is still a **FIFO** byte
+stream: frames arrive in the order the monitor writes them. **Every**
+frame is a *reply*, so its `request_id` tells you which outstanding Arca
+request it completes. There is **no** secondary stash queue for
+out-of-order arrivals.
 
-- request/reply pairs (Arca asks, Linux answers), and
-- unsolicited events (`IncomingConnection`, pushed by Linux whenever a peer connects).
+### Accept before kernel `accept`
 
-Concretely the control pipe is a `BidirectionalPipe`, which is two
-one-way ring buffers in shared memory — one for each direction. Below
-we only care about the **Linux → Arca** direction, since that's the
-one carrying both replies *and* events. Bytes leave the monitor in the
-order it writes them, and arrive at Arca in the same order (it's a FIFO
-ring). The monitor has no idea what Arca is currently waiting on.
+Because `IncomingConnection` is only emitted after an `AcceptRequest`,
+the monitor cannot push inbound sessions “ahead of” unrelated replies.
+For example, while Arca waits on `ConnectOk(rid=43)`, there is no longer a
+scenario where two `IncomingConnection` events sit in front of that reply in
+the ring without matching `AcceptRequest`s.
 
-So this timeline:
+### Pipelined control ops
 
-```
-t=1   peer A connects to our listener         monitor writes IncomingConnection(conn=7) into the ring
-t=2   peer B connects to our listener         monitor writes IncomingConnection(conn=8) into the ring
-t=3   Arca calls connect(8.8.8.8:443)         Arca writes ConnectRequest(rid=43) into the OTHER direction
-t=4   monitor receives that request,
-      handshakes outbound, replies            monitor writes ConnectOk(rid=43) into the ring
-```
+Several Arca threads may each block in `bind`, `connect`, or `accept` with
+distinct `request_id`s. The **completion order** is whatever the monitor
+produces; the Arca library reads frames strictly in FIFO order. If thread A
+is waiting for `rid=2` but the next frame on the wire is `ConnectOk` for
+`rid=7`, that is a **protocol / scheduling bug** (you need a single
+reader/demux, or you must guarantee the monitor completes requests in the
+same order Arca expects). The reference `ArcaSession` implementation
+therefore **errors** on a mismatched `request_id` while waiting for a
+specific reply.
 
-leaves the Linux→Arca ring looking like this when Arca's `connect()`
-finally gets around to reading from it:
+### “Peek” and CPU yield
 
-```
-   front of FIFO  ───────────────────────────────────────►  back of FIFO
-   (Arca reads next)                                    (most recently written)
-
-   ┌────────────────────────────┐ ┌────────────────────────────┐ ┌──────────────────────┐
-   │ IncomingConnection         │ │ IncomingConnection         │ │ ConnectOk            │
-   │   listener=1, conn=7       │ │   listener=1, conn=8       │ │   rid=43             │
-   │   rid=0  (unsolicited)     │ │   rid=0  (unsolicited)     │ │                      │
-   └────────────────────────────┘ └────────────────────────────┘ └──────────────────────┘
-        ▲
-        │
-        Arca's next read() pulls bytes from here.
-        It's *not* the ConnectOk — that's two frames behind.
-```
-
-Arca was waiting for `ConnectOk(rid=43)`, but the bytes the ring hands
-back first are the two `IncomingConnection` frames the monitor wrote
-earlier. We can't ask the ring "skip those and give me the next reply" —
-it's a plain FIFO. So Arca has to read the two events out of the ring
-before the bytes for `ConnectOk` are even reachable. That's the reading
-half of the problem.
-
-The other half: once we've read those event frames, **what do we do with
-them?** Each one carries data that we can't reconstruct later:
-
-- `connection_id` was just assigned by the monitor when the kernel
-  `accept()` returned. There's no way to re-derive it on the Arca side.
-- `pipe.pipe_id` / `pipe.ring_size` are handles to a specific shared
-  memory region the monitor allocated for *this* connection.
-
-If we drop the bytes and just remember "an event happened," when `accept()`
-is later called there's nothing to hand back — the new connection on Linux
-is orphaned. So the payloads have to live somewhere until the application
-asks for them. That somewhere is the **event stash**.
-
-### How the stash works
-
-The Arca-side library keeps a small fixed-size queue of `IncomingConnection`
-payloads:
-
-- During `bind` / `connect`: when waiting for a reply, any
-  `IncomingConnection` that arrives first is moved into the stash and the
-  read continues until the matching `request_id` reply shows up.
-- During `accept(&listener)`: the stash is checked **first** for an entry
-  whose `listener_id` matches. If found, return it without touching the
-  wire. Otherwise read from the wire; if a frame arrives that is for some
-  *other* listener, stash it and keep reading until the right one comes.
-
-The stash is currently sized at **8 events**. If it overflows, the library
-returns `ArcaError::PendingIncomingOverflow` rather than dropping events
-silently — losing an event would mean leaking a connection on the monitor
-side. "8 connections landing with zero `accept` calls in between" is
-already outside the simple-protocol scope; if it becomes real the size
-either bumps or the queue moves into a heap-allocated structure.
-
-### One outstanding control request at a time
-
-For now the protocol assumes **at most one outstanding control request
-per pipe** (no pipelined `connect`s, etc.). The stash is purely about
-unsolicited events stepping in front of a reply, not about multiple
-concurrent replies. Pipelined / async control ops are out of scope (§9);
-the existing `request_id` field is what we'd use when we get there.
+On **non-blocking** transports the codecs spin when a read or write returns
+`WouldBlock`; they call `core::hint::spin_loop` so other hardware threads can
+make progress. The monitor’s `serve_one` similarly calls `std::thread::yield_now`
+while waiting for the incremental decoder to fill a complete frame. That is
+the cooperative wait for the control pipe driver, without a separate buffer
+of undelivered frames on Arca.
 
 ---
 
@@ -434,20 +404,25 @@ The monitor is currently single-threaded. The intended drive loop is:
 
 ```rust
 loop {
-    monitor.flush_events(&mut control_pipe)?;     // push any IncomingConnection events
-    monitor.serve_one(&mut control_pipe)?;        // read one request, reply
-    // Eventually: also pump bytes between live TcpStreams and per-session pipes.
+    monitor.pump_once(&mut control_pipe)?;
+    // Eventually: pump bytes between live TcpStreams and per-session pipes.
 }
 ```
 
-`flush_events` is non-blocking (`accept` is set non-blocking on every
-listener). `serve_one` *does* block — the codec spins on `WouldBlock` on
-the read side. That's fine for the simple version: Arca's request/reply
-pattern means the monitor only sits in `serve_one` while Arca is
-expecting a reply from it.
+`pump_once` is **non-blocking** on the transport: it runs `poll_accepts`
+(a non-blocking kernel `accept` for listeners that have pending Arca
+`AcceptRequest` IDs) and then drains every fully received Arca→Linux frame
+from an internal reassembly buffer.
+
+`Monitor::serve_one` spins (with `yield_now`) until one complete Arca→Linux
+frame is available — useful when the caller prefers a blocking API.
+
+`dispatch_request` handles only `ListenRequest` and `ConnectRequest`; the
+latter **blocks** on `TcpStream::connect` until the kernel handshake
+finishes (connect waits).
 
 The monitor explicitly **does not** force connection streams non-blocking.
-That's a policy decision for the byte-pump layer (Luna) — the control
+That's a policy decision for the byte-pump layer — the control
 protocol just hands off the `TcpStream`.
 
 ### Comparison with `io_uring`
@@ -473,8 +448,9 @@ In rough priority order, things this iteration intentionally doesn't do:
 3. **IPv6.** `Endpoint` is fixed at 4 octets. When IPv6 lands, either
    add a sibling type or change `Endpoint` to a length-prefixed form
    (which would be the first wire-incompatible change).
-4. **Async / pipelined control ops.** Today: one in-flight request per
-   pipe. Tomorrow: many. The `request_id` is already there for it.
+4. **Rich error replies for `AcceptRequest`** (unknown listener today maps
+   to `MonitorError::UnknownListener` on the monitor side; Arca has no
+   `AcceptErr` frame yet).
 5. **Backpressure on the control pipe.** The codec spins on `WouldBlock`.
    That's fine when traffic is low; under load we want a proper readiness
    mechanism (epoll-style on Linux side, signaling primitive on Arca).
@@ -494,17 +470,17 @@ In rough priority order, things this iteration intentionally doesn't do:
 
 ```
 arca-networking/
-├── pipe/                  # arca-pipe (Greg)        — no_std bidirectional pipe
-├── control/               # arca-control (Majd)     — no_std control protocol
+├── pipe/                  # arca-pipe — bidirectional pipe
+├── control/               # arca-control — wire types, codec, ArcaSession
 │   └── src/
 │       ├── protocol.rs    #   wire types + payload encodings
-│       ├── codec.rs       #   read_frame / write_frame
+│       ├── codec.rs       #   read_frame / write_frame / FrameReadBuf
 │       ├── arca_side.rs   #   ArcaSession, ArcaTcpListener, ArcaTcpStream
 │       └── lib.rs
-├── monitor/               # arca-monitor (Majd)     — std, Linux-side driver
+├── monitor/               # arca-monitor — Linux-side driver
 │   ├── src/
-│   │   ├── lib.rs         #   Monitor, dispatch_request, serve_one, flush_events
-│   │   └── relay.rs       #   tcp_to_pipe / pipe_to_tcp helpers (will graduate to Luna's data crate)
+│   │   ├── lib.rs         #   Monitor, dispatch_request, pump_once, serve_one, poll_accepts
+│   │   └── relay.rs       #   tcp_to_pipe / pipe_to_tcp helpers
 │   └── tests/end_to_end.rs
 └── PROTOCOL.md            # this file
 ```
@@ -522,7 +498,7 @@ let inbound  = sess.accept(&listener)?;        // ArcaTcpStream
 let outbound = sess.connect(Endpoint::new([8, 8, 8, 8], 443))?; // ArcaTcpStream
 
 // inbound.pipe()  ──► DataPipeInfo { pipe_id, ring_size }
-// hand off to Luna's data-pipe wrapper for read/write.
+// then attach your per-session pipe / byte layer for read/write.
 ```
 
 Everything beyond returning the `ArcaTcpStream` handle (i.e., actually

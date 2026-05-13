@@ -5,32 +5,33 @@
 //!
 //! - The monitor owns one [`TcpListener`] per `ListenerReady` it has handed
 //!   out, and one [`TcpStream`] per live connection.
-//! - Listeners are kept **non-blocking** so we can `accept` opportunistically
-//!   inside [`Monitor::poll_incoming`] without hanging the I/O thread.
+//! - Listeners are kept **non-blocking** so [`Monitor::poll_accepts`] can probe
+//!   the kernel when Arca has queued an accept wait, without wedging the I/O
+//!   thread when no TCP peer is ready yet.
 //! - Connection streams are left in their default mode — the *byte pump*
 //!   (the data-pipe layer) decides blocking vs non-blocking based on its own
 //!   scheduling needs.
 //!
 //! Driving the protocol is one of:
-//! - [`Monitor::dispatch_request`] — pure function: in: request frame,
-//!   out: reply frame. Useful in tests and for callers who want to do their
-//!   own framing.
-//! - [`Monitor::serve_one`] — wired up against a control pipe transport:
-//!   read one frame, dispatch, write the reply. Plus [`Monitor::flush_events`]
-//!   to drain pending `IncomingConnection` events. Use these in a loop on
-//!   the single I/O thread.
+//! - [`Monitor::dispatch_request`] — `Listen` / `Connect` only (for tests and
+//!   custom drivers); [`MessageType::AcceptRequest`] is handled in
+//!   [`Monitor::pump_once`] / [`Monitor::serve_one`].
+//! - [`Monitor::pump_once`] — non-blocking kernel accepts + try read every
+//!   fully received Arca→Linux frame on `transport`.
+//! - [`Monitor::serve_one`] — spins until a full Arca→Linux frame exists, then
+//!   dispatches it (uses [`std::thread::yield_now`] while waiting).
 
 mod relay;
 
 pub use relay::{pipe_to_tcp, tcp_to_pipe};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 
 use arca_control::{
-    read_frame, write_frame, CodecError, ConnectionReady, ControlFrame, DataPipeInfo, Endpoint,
-    ErrPayload, ListenerReady, MessageType,
+    write_frame, AcceptListenerId, CodecError, ConnectionReady, ControlFrame, DataPipeInfo,
+    Endpoint, ErrPayload, FrameReadBuf, ListenerReady, MessageType,
 };
 use arca_pipe::{Read, Write};
 
@@ -39,6 +40,8 @@ pub enum MonitorError {
     Io(io::Error),
     Codec(CodecError),
     UnexpectedRequest(MessageType),
+    /// Accept referenced an unknown `listener_id`.
+    UnknownListener(u32),
 }
 
 impl From<io::Error> for MonitorError {
@@ -65,6 +68,9 @@ pub struct Monitor {
     default_ring_size: u64,
     listeners: HashMap<u32, TcpListener>,
     connections: HashMap<u32, TcpStream>,
+    /// For each listener, FIFO of Arca `request_id`s waiting for a kernel `accept`.
+    pending_accepts: HashMap<u32, VecDeque<u32>>,
+    control_rx: FrameReadBuf,
 }
 
 impl Monitor {
@@ -76,14 +82,16 @@ impl Monitor {
             default_ring_size,
             listeners: HashMap::new(),
             connections: HashMap::new(),
+            pending_accepts: HashMap::new(),
+            control_rx: FrameReadBuf::new(),
         }
     }
 
     /// Translate one Arca → Linux request frame into the reply we owe Arca.
     ///
-    /// This is a pure-ish function over `&mut self` (state changes are
-    /// inserts into the listener/connection maps). It does **no** I/O on the
-    /// control pipe — see [`Monitor::serve_one`] for the wired-up version.
+    /// Handles only [`MessageType::ListenRequest`] and
+    /// [`MessageType::ConnectRequest`]. [`MessageType::AcceptRequest`] is
+    /// handled in [`Monitor::handle_control_frame`].
     pub fn dispatch_request(&mut self, frame: ControlFrame) -> Result<ControlFrame, MonitorError> {
         let rid = frame.request_id;
         match frame.message_type {
@@ -92,8 +100,6 @@ impl Monitor {
                 let addr = SocketAddr::from((Ipv4Addr::from(ep.host), ep.port));
                 match TcpListener::bind(addr) {
                     Ok(listener) => {
-                        // Non-blocking on the listener so poll_incoming can
-                        // be called from the single I/O thread.
                         listener.set_nonblocking(true)?;
                         let id = self.alloc_listener_id();
                         self.listeners.insert(id, listener);
@@ -107,10 +113,9 @@ impl Monitor {
             MessageType::ConnectRequest => {
                 let ep = Endpoint::decode(frame.payload());
                 let addr = SocketAddr::from((Ipv4Addr::from(ep.host), ep.port));
+                // Blocks until the kernel handshake completes — “connect waits”.
                 match TcpStream::connect(addr) {
                     Ok(stream) => {
-                        // Leave blocking-mode alone; that's the byte-pump's
-                        // call. We just hand the stream off.
                         let id = self.alloc_connection_id();
                         self.connections.insert(id, stream);
                         Ok(ready_frame(
@@ -126,73 +131,107 @@ impl Monitor {
                     Err(e) => Ok(err_frame(MessageType::ConnectErr, rid, io_err_code(&e))),
                 }
             }
+            MessageType::AcceptRequest => Err(MonitorError::UnexpectedRequest(
+                MessageType::AcceptRequest,
+            )),
             other => Err(MonitorError::UnexpectedRequest(other)),
         }
     }
 
-    /// Non-blocking sweep across all listeners. For each pending accept,
-    /// return one [`MessageType::IncomingConnection`] frame Arca should
-    /// receive.
-    ///
-    /// Returns frames in arrival order. Caller is responsible for actually
-    /// writing them onto the control pipe (see [`Monitor::flush_events`]).
-    pub fn poll_incoming(&mut self) -> Vec<ControlFrame> {
+    /// Try pairing pending Arca `AcceptRequest`s with kernel `accept` results,
+    /// writing one [`MessageType::IncomingConnection`] per successful accept
+    /// (each carrying the Arca-issued `request_id`).
+    pub fn poll_accepts<T: Write>(&mut self, transport: &mut T) -> Result<usize, MonitorError> {
         use std::io::ErrorKind;
-        let mut out = Vec::new();
-        let ids: Vec<u32> = self.listeners.keys().copied().collect();
-        for lid in ids {
+        let mut written = 0usize;
+        let lids: Vec<u32> = self
+            .pending_accepts
+            .iter()
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(k, _)| *k)
+            .collect();
+        for lid in lids {
             let Some(listener) = self.listeners.get_mut(&lid) else {
                 continue;
             };
-            loop {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let cid = self.next_connection_id;
-                        self.next_connection_id = self.next_connection_id.wrapping_add(1);
-                        if self.next_connection_id == 0 {
-                            self.next_connection_id = 1;
-                        }
-                        self.connections.insert(cid, stream);
-                        out.push(ready_frame(
-                            MessageType::IncomingConnection,
-                            // Unsolicited events use request_id 0.
-                            0,
-                            ConnectionReady {
-                                listener_id: lid,
-                                connection_id: cid,
-                                pipe: DataPipeInfo::new(cid, self.default_ring_size),
-                            },
-                        ));
-                    }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                    // A different error on a single listener shouldn't kill
-                    // the whole sweep — drop it for now and move on.
-                    Err(_) => break,
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let Some(rid) = self
+                        .pending_accepts
+                        .get_mut(&lid)
+                        .and_then(|q| q.pop_front())
+                    else {
+                        continue;
+                    };
+                    let cid = self.alloc_connection_id();
+                    self.connections.insert(cid, stream);
+                    let fr = ready_frame(
+                        MessageType::IncomingConnection,
+                        rid,
+                        ConnectionReady {
+                            listener_id: lid,
+                            connection_id: cid,
+                            pipe: DataPipeInfo::new(cid, self.default_ring_size),
+                        },
+                    );
+                    write_frame(transport, &fr)?;
+                    written += 1;
                 }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(_) => {}
             }
         }
-        out
+        Ok(written)
     }
 
-    /// Read one request from `transport`, dispatch it, write the reply back.
-    ///
-    /// Blocks until a full request frame arrives. Use this in the body of
-    /// the I/O thread loop after [`Monitor::flush_events`].
-    pub fn serve_one<T: Read + Write>(&mut self, transport: &mut T) -> Result<(), MonitorError> {
-        let frame = read_frame(transport)?;
-        let reply = self.dispatch_request(frame)?;
-        write_frame(transport, &reply)?;
+    /// Non-blocking progress: poll kernel accepts, then read and handle every
+    /// fully received Arca→Linux frame currently available on `transport`.
+    pub fn pump_once<T: Read + Write>(&mut self, transport: &mut T) -> Result<(), MonitorError> {
+        self.poll_accepts(transport)?;
+        while let Some(frame) = self.control_rx.try_read_frame(transport)? {
+            self.handle_control_frame(transport, frame)?;
+        }
         Ok(())
     }
 
-    /// Drain pending `IncomingConnection` events to the control pipe.
-    pub fn flush_events<T: Write>(&mut self, transport: &mut T) -> Result<usize, MonitorError> {
-        let events = self.poll_incoming();
-        let n = events.len();
-        for f in events {
-            write_frame(transport, &f)?;
+    fn handle_control_frame<T: Write>(
+        &mut self,
+        transport: &mut T,
+        frame: ControlFrame,
+    ) -> Result<(), MonitorError> {
+        match frame.message_type {
+            MessageType::AcceptRequest => {
+                let lid = AcceptListenerId::decode(frame.payload()).listener_id;
+                if !self.listeners.contains_key(&lid) {
+                    return Err(MonitorError::UnknownListener(lid));
+                }
+                self.pending_accepts
+                    .entry(lid)
+                    .or_default()
+                    .push_back(frame.request_id);
+                self.poll_accepts(transport)?;
+                Ok(())
+            }
+            _ => {
+                let reply = self.dispatch_request(frame)?;
+                write_frame(transport, &reply)?;
+                self.poll_accepts(transport)?;
+                Ok(())
+            }
         }
-        Ok(n)
+    }
+
+    /// Read and dispatch one Arca→Linux frame. Spins with
+    /// [`std::thread::yield_now`] until the incremental decoder can produce a
+    /// full frame (transport keeps returning [`arca_pipe::PipeError::WouldBlock`]).
+    pub fn serve_one<T: Read + Write>(&mut self, transport: &mut T) -> Result<(), MonitorError> {
+        loop {
+            self.poll_accepts(transport)?;
+            if let Some(frame) = self.control_rx.try_read_frame(transport)? {
+                return self.handle_control_frame(transport, frame);
+            }
+            std::thread::yield_now();
+        }
     }
 
     /// Borrow a live connection's `TcpStream` for the byte pump.
@@ -208,7 +247,6 @@ impl Monitor {
     fn alloc_listener_id(&mut self) -> u32 {
         let id = self.next_listener_id;
         self.next_listener_id = self.next_listener_id.wrapping_add(1);
-        // Keep the "0 means no listener" sentinel safe across wrap-around.
         if self.next_listener_id == 0 {
             self.next_listener_id = 1;
         }
@@ -222,6 +260,16 @@ impl Monitor {
             self.next_connection_id = 1;
         }
         id
+    }
+}
+
+#[cfg(test)]
+impl Monitor {
+    pub(crate) fn test_enqueue_accept(&mut self, listener_id: u32, rid: u32) {
+        self.pending_accepts
+            .entry(listener_id)
+            .or_default()
+            .push_back(rid);
     }
 }
 
@@ -240,7 +288,8 @@ fn ready_frame(kind: MessageType, rid: u32, ready: ConnectionReady) -> ControlFr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arca_pipe::{PipeError, Write as PipeWrite};
+    use arca_control::read_frame;
+    use arca_pipe::{PipeError, Read as PipeRead, Write as PipeWrite};
     use std::io::{Read as IoRead, Write as IoWrite};
     use std::sync::mpsc;
     use std::thread;
@@ -253,6 +302,101 @@ mod tests {
             self.0.extend_from_slice(buf);
             Ok(buf.len())
         }
+    }
+
+    /// In-memory control pipe: pops inbound bytes, collects outbound writes.
+    struct QueuePipe {
+        inbound: std::collections::VecDeque<u8>,
+        outbound: Vec<u8>,
+    }
+
+    impl PipeRead for QueuePipe {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, PipeError> {
+            if self.inbound.is_empty() {
+                return Err(PipeError::WouldBlock);
+            }
+            let n = std::cmp::min(buf.len(), self.inbound.len());
+            for i in 0..n {
+                buf[i] = self.inbound.pop_front().unwrap();
+            }
+            Ok(n)
+        }
+    }
+
+    impl PipeWrite for QueuePipe {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, PipeError> {
+            self.outbound.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn pump_once_reads_accept_request_then_tcp_pairs_request_id() {
+        use arca_control::{write_frame, AcceptListenerId, ControlFrame};
+        let mut m = Monitor::new(64);
+        let bind_ep = Endpoint::new([127, 0, 0, 1], 0);
+        let mut pl = [0u8; arca_control::MAX_FRAME_PAYLOAD];
+        let n = bind_ep.encode(&mut pl);
+        let reply = m
+            .dispatch_request(ControlFrame::new(
+                MessageType::ListenRequest,
+                1,
+                &pl[..n],
+            ))
+            .unwrap();
+        let lid = ListenerReady::decode(reply.payload()).listener_id;
+
+        let mut pay = [0u8; 4];
+        AcceptListenerId { listener_id: lid }.encode(&mut pay);
+        let acc = ControlFrame::new(MessageType::AcceptRequest, 77, &pay);
+        let mut enc = VecWriter(Vec::new());
+        write_frame(&mut enc, &acc).unwrap();
+
+        let mut transport = QueuePipe {
+            inbound: std::collections::VecDeque::from(enc.0),
+            outbound: Vec::new(),
+        };
+        m.pump_once(&mut transport).unwrap();
+
+        let port = m
+            .listener(lid)
+            .expect("listener")
+            .local_addr()
+            .unwrap()
+            .port();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            let _ = TcpStream::connect(("127.0.0.1", port));
+        });
+        thread::sleep(Duration::from_millis(60));
+
+        let mut w = VecWriter(Vec::new());
+        assert_eq!(m.poll_accepts(&mut w).unwrap(), 1);
+
+        struct FrameSliceReader<'a> {
+            data: &'a [u8],
+            pos: usize,
+        }
+        impl PipeRead for FrameSliceReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> Result<usize, PipeError> {
+                if self.pos >= self.data.len() {
+                    return Err(PipeError::WouldBlock);
+                }
+                let n = std::cmp::min(buf.len(), self.data.len() - self.pos);
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+        let mut r = FrameSliceReader {
+            data: &w.0,
+            pos: 0,
+        };
+        let fr = read_frame(&mut r).unwrap();
+        assert_eq!(fr.message_type, MessageType::IncomingConnection);
+        assert_eq!(fr.request_id, 77);
+        let ready = ConnectionReady::decode(fr.payload());
+        assert_eq!(ready.listener_id, lid);
     }
 
     #[test]
@@ -313,6 +457,7 @@ mod tests {
         let reply = m.dispatch_request(req).unwrap();
         let lid = ListenerReady::decode(reply.payload()).listener_id;
         let port = m.listeners.get(&lid).unwrap().local_addr().unwrap().port();
+        m.test_enqueue_accept(lid, 42);
 
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(20));
@@ -320,10 +465,35 @@ mod tests {
         });
 
         thread::sleep(Duration::from_millis(50));
-        let evs = m.poll_incoming();
-        assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0].message_type, MessageType::IncomingConnection);
-        let ready = ConnectionReady::decode(evs[0].payload());
+        let mut w = VecWriter(Vec::new());
+        let written = m.poll_accepts(&mut w).unwrap();
+        assert_eq!(written, 1);
+
+        struct SliceReader<'a> {
+            data: &'a [u8],
+            pos: usize,
+        }
+
+        impl PipeRead for SliceReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> Result<usize, PipeError> {
+                if self.pos >= self.data.len() {
+                    return Err(PipeError::WouldBlock);
+                }
+                let n = std::cmp::min(buf.len(), self.data.len() - self.pos);
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        let mut r = SliceReader {
+            data: &w.0,
+            pos: 0,
+        };
+        let ev = read_frame(&mut r).unwrap();
+        assert_eq!(ev.message_type, MessageType::IncomingConnection);
+        assert_eq!(ev.request_id, 42);
+        let ready = ConnectionReady::decode(ev.payload());
         assert_eq!(ready.listener_id, lid);
     }
 

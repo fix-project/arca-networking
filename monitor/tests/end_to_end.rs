@@ -11,8 +11,9 @@
 //! What *is* exercised:
 //! - The full request/reply round trip across two threads.
 //! - Real outbound `connect` against a stdlib `TcpListener` peer.
-//! - Real inbound `accept` flow: Arca `bind`, peer connects, monitor
-//!   pushes `IncomingConnection`, Arca `accept` returns the matching stream.
+//! - Real inbound `accept` flow: Arca `bind`, Arca `accept` (posts
+//!   `AcceptRequest`), monitor pairs the kernel `accept` with that wait and
+//!   replies with `IncomingConnection`.
 
 use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
@@ -156,13 +157,13 @@ fn arca_bind_then_accept_after_external_connect() {
         port_tx.send(port).unwrap();
         write_frame(&mut mon_end, &reply).unwrap();
 
-        // 2. Pump events until shutdown.
+        // 2. Poll: kernel accepts + any Arca→Linux frames (AcceptRequest, …).
         while !shutdown_for_thread.load(Ordering::Relaxed) {
-            m.flush_events(&mut mon_end).unwrap();
+            m.pump_once(&mut mon_end).unwrap();
             thread::sleep(Duration::from_millis(2));
         }
-        // Final flush in case an event slipped in just before shutdown.
-        m.flush_events(&mut mon_end).unwrap();
+        // Last pass so a frame just before shutdown is not left stranded.
+        m.pump_once(&mut mon_end).unwrap();
         m
     });
 
@@ -176,7 +177,7 @@ fn arca_bind_then_accept_after_external_connect() {
     // External peer connects to the bound port.
     let port = port_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     let _peer = thread::spawn(move || {
-        // Tiny delay so the monitor's flush_events loop is already running.
+        // Tiny delay so the monitor's pump loop is already running.
         thread::sleep(Duration::from_millis(20));
         let _stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         // Hold the connection open until the test ends, otherwise the peer
