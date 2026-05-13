@@ -9,9 +9,8 @@
 //!   control pipe, an `arca_pipe::BidirectionalPipe`).
 //! - Arca side: [`ArcaSession`] owns the control pipe and exposes
 //!   [`ArcaSession::bind`] / [`ArcaSession::connect`] / [`ArcaSession::accept`]
-//!   — built to *feel* like `std::net::{TcpListener, TcpStream}`. The
-//!   returned [`ArcaTcpListener`] / [`ArcaTcpStream`] are lightweight
-//!   handles; per-connection bytestreams live in **separate** data pipes.
+//!   — `accept` sends [`MessageType::AcceptRequest`] and waits for
+//!   [`MessageType::IncomingConnection`].
 //!
 //! `no_std` throughout. The Linux-side counterpart lives in `arca-monitor`.
 
@@ -22,5 +21,5 @@ mod codec;
 pub mod protocol;
 
 pub use arca_side::{ArcaError, ArcaSession, ArcaTcpListener, ArcaTcpStream};
-pub use codec::{read_frame, write_frame, CodecError, HEADER_LEN};
+pub use codec::{read_frame, write_frame, CodecError, FrameReadBuf, HEADER_LEN, MAX_WIRE_FRAME_LEN};
 pub use protocol::*;

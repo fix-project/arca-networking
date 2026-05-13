@@ -45,13 +45,19 @@ pub enum MessageType {
     ConnectRequest = 3,
     /// Linux → Arca: outbound connect succeeded; payload is [`ConnectionReady`].
     ConnectOk = 4,
-    /// Linux → Arca (unsolicited): a peer just connected to one of our
-    /// listeners; payload is [`ConnectionReady`] with `listener_id` set.
+    /// Linux → Arca: reply to [`MessageType::AcceptRequest`]; payload is
+    /// [`ConnectionReady`] with `listener_id` set.
     IncomingConnection = 5,
     /// Linux → Arca: bind/listen failed; payload is [`ErrPayload`].
     ListenErr = 6,
     /// Linux → Arca: outbound connect failed; payload is [`ErrPayload`].
     ConnectErr = 7,
+    /// Arca → Linux: block until the next inbound TCP connection on this
+    /// listener; payload is [`AcceptListenerId`] (4 B).
+    ///
+    /// The matching reply is [`MessageType::IncomingConnection`] with the same
+    /// `request_id`.
+    AcceptRequest = 8,
 }
 
 impl MessageType {
@@ -66,6 +72,7 @@ impl MessageType {
             5 => Some(Self::IncomingConnection),
             6 => Some(Self::ListenErr),
             7 => Some(Self::ConnectErr),
+            8 => Some(Self::AcceptRequest),
             _ => None,
         }
     }
@@ -157,6 +164,25 @@ impl ListenerReady {
     }
 }
 
+/// Payload of [`MessageType::AcceptRequest`]: which listener to `accept` on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptListenerId {
+    pub listener_id: u32,
+}
+
+impl AcceptListenerId {
+    pub fn encode(&self, out: &mut [u8; 4]) {
+        out.copy_from_slice(&self.listener_id.to_le_bytes());
+    }
+
+    pub fn decode(payload: &[u8]) -> Self {
+        assert!(payload.len() == 4, "accept-listener payload must be 4 bytes");
+        Self {
+            listener_id: u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
+        }
+    }
+}
+
 /// Payload of [`MessageType::ListenErr`] / [`MessageType::ConnectErr`].
 ///
 /// `code` is the Linux `errno` when available, else `1` for "unknown".
@@ -216,8 +242,8 @@ impl DataPipeInfo {
     }
 }
 
-/// Payload of both [`MessageType::ConnectOk`] (outbound) and
-/// [`MessageType::IncomingConnection`] (inbound). Same fields, same layout —
+/// Payload of [`MessageType::ConnectOk`] (outbound), [`MessageType::IncomingConnection`]
+/// (reply to [`MessageType::AcceptRequest`]). Same fields, same layout —
 /// the message kind is what tells you which is which.
 ///
 /// `listener_id == 0` means "outbound connection, no listener was involved".
@@ -262,6 +288,7 @@ mod tests {
             MessageType::IncomingConnection,
             MessageType::ListenErr,
             MessageType::ConnectErr,
+            MessageType::AcceptRequest,
         ] {
             assert_eq!(MessageType::from_u8(mt as u8), Some(mt));
         }
@@ -270,7 +297,7 @@ mod tests {
     #[test]
     fn message_type_from_u8_unknown() {
         assert_eq!(MessageType::from_u8(0), None);
-        assert_eq!(MessageType::from_u8(8), None);
+        assert_eq!(MessageType::from_u8(9), None);
         assert_eq!(MessageType::from_u8(255), None);
     }
 
@@ -288,6 +315,14 @@ mod tests {
         let mut buf = [0u8; 4];
         lr.encode(&mut buf);
         assert_eq!(ListenerReady::decode(&buf), lr);
+    }
+
+    #[test]
+    fn accept_listener_id_round_trip() {
+        let a = AcceptListenerId { listener_id: 0x00ab_cd01 };
+        let mut buf = [0u8; 4];
+        a.encode(&mut buf);
+        assert_eq!(AcceptListenerId::decode(&buf), a);
     }
 
     #[test]
