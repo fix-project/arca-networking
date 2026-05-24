@@ -15,7 +15,7 @@ pub fn tcp_to_pipe(tcp: &mut TcpStream, pipe: &mut impl Write) -> std::io::Resul
                 match pipe.write(&buf[off..n]) {
                     Ok(0) => return Ok(off),
                     Ok(m) => off += m,
-                    Err(PipeError::WouldBlock) => {}
+                    Err(PipeError::WouldBlock) => std::thread::yield_now(),
                 }
             }
             Ok(n)
