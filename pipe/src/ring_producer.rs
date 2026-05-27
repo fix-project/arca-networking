@@ -13,6 +13,14 @@ impl<'a> RingProducer<'a> {
     pub fn new(header: &'a RingHeader, data: RingData) -> Self {
         Self { header, data }
     }
+
+    /// Bytes written by this producer that the consumer has not yet read.
+    /// Uses Acquire on read_cursor so this can be called cross-thread safely.
+    pub fn bytes_pending(&self) -> u64 {
+        let write = self.header.write_cursor.load(Ordering::Relaxed);
+        let read  = self.header.read_cursor.load(Ordering::Acquire);
+        write.wrapping_sub(read)
+    }
 }
 
 impl<'a> traits::Write for RingProducer<'a> {
@@ -111,5 +119,33 @@ mod tests {
         assert_eq!(p.write(b"").unwrap(), 0);
     }
 
+    #[test]
+    fn bytes_pending_empty() {
+        let h = header();
+        let mut mem = [0u8; 8];
+        let data = unsafe { RingData::new(mem.as_mut_ptr(), 8) };
+        let p = RingProducer::new(&h, data);
+        assert_eq!(p.bytes_pending(), 0);
+    }
 
+    #[test]
+    fn bytes_pending_after_write() {
+        let h = header();
+        let mut mem = [0u8; 8];
+        let data = unsafe { RingData::new(mem.as_mut_ptr(), 8) };
+        let mut p = RingProducer::new(&h, data);
+        p.write(b"hello").unwrap();
+        assert_eq!(p.bytes_pending(), 5);
+    }
+
+    #[test]
+    fn bytes_pending_zero_after_full_read() {
+        let h = header();
+        let mut mem = [0u8; 8];
+        let data = unsafe { RingData::new(mem.as_mut_ptr(), 8) };
+        let mut p = RingProducer::new(&h, data);
+        p.write(b"hello").unwrap();
+        h.read_cursor.store(5, Ordering::Release);
+        assert_eq!(p.bytes_pending(), 0);
+    }
 }
