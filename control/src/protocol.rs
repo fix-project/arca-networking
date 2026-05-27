@@ -212,14 +212,14 @@ impl ErrPayload {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataPipeInfo {
     /// Opaque handle agreed by both sides (e.g., index into a SHM table).
-    pub pipe_id: u32,
+    pub pipe_id: u64,
     /// Per-direction ring capacity in bytes (same value passed to
     /// [`BidirectionalPipe::new`]).
     pub ring_size: u64,
 }
 
 impl DataPipeInfo {
-    pub fn new(pipe_id: u32, ring_size: u64) -> Self {
+    pub fn new(pipe_id: u64, ring_size: u64) -> Self {
         Self { pipe_id, ring_size }
     }
 
@@ -228,16 +228,16 @@ impl DataPipeInfo {
         BidirectionalPipe::required_size(self.ring_size)
     }
 
-    pub fn encode(&self, out: &mut [u8; 12]) {
-        out[..4].copy_from_slice(&self.pipe_id.to_le_bytes());
-        out[4..12].copy_from_slice(&self.ring_size.to_le_bytes());
+    pub fn encode(&self, out: &mut [u8; 16]) {
+        out[..8].copy_from_slice(&self.pipe_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.ring_size.to_le_bytes());
     }
 
     pub fn decode(payload: &[u8]) -> Self {
-        assert!(payload.len() == 12, "data pipe info payload must be 12 bytes");
+        assert!(payload.len() == 16, "data pipe info payload must be 16 bytes");
         Self {
-            pipe_id: u32::from_le_bytes(payload[0..4].try_into().unwrap()),
-            ring_size: u64::from_le_bytes(payload[4..12].try_into().unwrap()),
+            pipe_id: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+            ring_size: u64::from_le_bytes(payload[8..16].try_into().unwrap()),
         }
     }
 }
@@ -256,20 +256,20 @@ pub struct ConnectionReady {
 }
 
 impl ConnectionReady {
-    pub fn encode(&self, out: &mut [u8; 20]) {
+    pub fn encode(&self, out: &mut [u8; 24]) {
         out[..4].copy_from_slice(&self.listener_id.to_le_bytes());
         out[4..8].copy_from_slice(&self.connection_id.to_le_bytes());
-        let mut pipe_buf = [0u8; 12];
+        let mut pipe_buf = [0u8; 16];
         self.pipe.encode(&mut pipe_buf);
-        out[8..20].copy_from_slice(&pipe_buf);
+        out[8..24].copy_from_slice(&pipe_buf);
     }
 
     pub fn decode(payload: &[u8]) -> Self {
-        assert!(payload.len() == 20, "connection ready payload must be 20 bytes");
+        assert!(payload.len() == 24, "connection ready payload must be 24 bytes");
         Self {
             listener_id: u32::from_le_bytes(payload[0..4].try_into().unwrap()),
             connection_id: u32::from_le_bytes(payload[4..8].try_into().unwrap()),
-            pipe: DataPipeInfo::decode(&payload[8..20]),
+            pipe: DataPipeInfo::decode(&payload[8..24]),
         }
     }
 }
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn data_pipe_info_round_trip() {
         let info = DataPipeInfo::new(99, 1024);
-        let mut buf = [0u8; 12];
+        let mut buf = [0u8; 16];
         info.encode(&mut buf);
         assert_eq!(DataPipeInfo::decode(&buf), info);
     }
@@ -362,7 +362,7 @@ mod tests {
             connection_id: 9,
             pipe: DataPipeInfo::new(100, 64),
         };
-        let mut buf = [0u8; 20];
+        let mut buf = [0u8; 24];
         ready.encode(&mut buf);
         assert_eq!(ConnectionReady::decode(&buf), ready);
     }

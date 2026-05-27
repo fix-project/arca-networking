@@ -106,7 +106,7 @@ fn arca_connect_round_trip_against_real_tcp_listener() {
     assert!(!stream.is_inbound(), "outbound connect has listener_id 0");
     assert_eq!(stream.connection_id(), 1, "first connection gets id 1");
     assert_eq!(stream.pipe().ring_size, 64, "ring_size from default config");
-    assert_eq!(stream.pipe().pipe_id, stream.connection_id());
+    assert_eq!(stream.pipe().pipe_id, stream.connection_id() as u64);
 
     // Monitor returns; verify it actually owns a live socket for that id.
     let mut m = monitor_thread.join().unwrap();

@@ -267,7 +267,7 @@ mod tests {
             connection_id: 42,
             pipe: DataPipeInfo::new(7, 128),
         };
-        let mut pl = [0u8; 20];
+        let mut pl = [0u8; 24];
         ready.encode(&mut pl);
         let frame = ControlFrame::new(MessageType::ConnectOk, 100, &pl);
 

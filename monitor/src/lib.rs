@@ -124,7 +124,10 @@ impl Monitor {
                             ConnectionReady {
                                 listener_id: 0,
                                 connection_id: id,
-                                pipe: DataPipeInfo::new(id, self.default_ring_size),
+                                // TODO: allocate real SHM region of size
+                                // BidirectionalPipe::required_size(self.default_ring_size)
+                                // and pass the returned handle here instead of `id as u64`.
+                                pipe: DataPipeInfo::new(id as u64, self.default_ring_size),
                             },
                         ))
                     }
@@ -171,7 +174,10 @@ impl Monitor {
                         ConnectionReady {
                             listener_id: lid,
                             connection_id: cid,
-                            pipe: DataPipeInfo::new(cid, self.default_ring_size),
+                            // TODO: allocate real SHM region of size
+                            // BidirectionalPipe::required_size(self.default_ring_size)
+                            // and pass the returned handle here instead of `cid as u64`.
+                            pipe: DataPipeInfo::new(cid as u64, self.default_ring_size),
                         },
                     );
                     write_frame(transport, &fr)?;
@@ -280,7 +286,7 @@ fn err_frame(kind: MessageType, rid: u32, code: u32) -> ControlFrame {
 }
 
 fn ready_frame(kind: MessageType, rid: u32, ready: ConnectionReady) -> ControlFrame {
-    let mut pl = [0u8; 20];
+    let mut pl = [0u8; 24];
     ready.encode(&mut pl);
     ControlFrame::new(kind, rid, &pl)
 }
