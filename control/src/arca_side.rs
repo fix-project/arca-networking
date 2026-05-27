@@ -292,13 +292,13 @@ mod tests {
     }
 
     fn connect_ok(rid: u32, ready: ConnectionReady) -> ControlFrame {
-        let mut pl = [0u8; 20];
+        let mut pl = [0u8; 24];
         ready.encode(&mut pl);
         ControlFrame::new(MessageType::ConnectOk, rid, &pl)
     }
 
     fn incoming(rid: u32, ready: ConnectionReady) -> ControlFrame {
-        let mut pl = [0u8; 20];
+        let mut pl = [0u8; 24];
         ready.encode(&mut pl);
         ControlFrame::new(MessageType::IncomingConnection, rid, &pl)
     }
