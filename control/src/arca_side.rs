@@ -39,6 +39,11 @@ pub enum ArcaError {
     ConnectFailed {
         code: u32,
     },
+    /// Linux returned `AcceptErr` with the given errno-like code (unknown
+    /// listener, or kernel `accept` failed on the monitor side).
+    AcceptFailed {
+        code: u32,
+    },
     /// Got a frame we weren't expecting — protocol bug or out-of-sync state.
     UnexpectedReply(MessageType),
     /// Reply came back with a `request_id` we didn't issue (wrong order on
@@ -176,6 +181,7 @@ impl<'a, T: Read + Write> ArcaSession<'a, T> {
 
         match self.read_reply_for(request_id)? {
             ControlReply::AcceptOk { ready, .. } => Ok(stream_from_ready(ready)),
+            ControlReply::AcceptErr { code, .. } => Err(ArcaError::AcceptFailed { code }),
             other => Err(ArcaError::UnexpectedReply(other.message_type())),
         }
     }
@@ -375,6 +381,23 @@ mod tests {
         let mut s = ArcaSession::new(&mut t);
         let err = s.bind(Endpoint::new([0, 0, 0, 0], 1)).unwrap_err();
         assert_eq!(err, ArcaError::ListenFailed { code: 98 });
+    }
+
+    #[test]
+    fn accept_failure_propagates_errno() {
+        let mut t = MemTransport::new();
+        t.push_inbound(
+            &ControlReply::AcceptErr {
+                request_id: 1,
+                code: 9,
+            }
+            .to_frame(),
+        );
+
+        let mut s = ArcaSession::new(&mut t);
+        let listener = ArcaTcpListener { listener_id: 99 };
+        let err = s.accept(&listener).unwrap_err();
+        assert_eq!(err, ArcaError::AcceptFailed { code: 9 });
     }
 
     struct SliceReader<'a> {

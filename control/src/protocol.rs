@@ -60,6 +60,9 @@ pub enum MessageType {
     ListenErr = 6,
     ConnectErr = 7,
     AcceptRequest = 8,
+    /// Linux → Arca: reply to [`MessageType::AcceptRequest`] when the
+    /// monitor couldn't fulfil it (unknown listener, kernel accept failed).
+    AcceptErr = 9,
 }
 
 impl MessageType {
@@ -75,6 +78,7 @@ impl MessageType {
             6 => Some(Self::ListenErr),
             7 => Some(Self::ConnectErr),
             8 => Some(Self::AcceptRequest),
+            9 => Some(Self::AcceptErr),
             _ => None,
         }
     }
@@ -182,6 +186,7 @@ mod tests {
             MessageType::ListenErr,
             MessageType::ConnectErr,
             MessageType::AcceptRequest,
+            MessageType::AcceptErr,
         ] {
             assert_eq!(MessageType::from_u8(mt as u8), Some(mt));
         }
@@ -190,7 +195,7 @@ mod tests {
     #[test]
     fn message_type_from_u8_unknown() {
         assert_eq!(MessageType::from_u8(0), None);
-        assert_eq!(MessageType::from_u8(9), None);
+        assert_eq!(MessageType::from_u8(10), None);
         assert_eq!(MessageType::from_u8(255), None);
     }
 

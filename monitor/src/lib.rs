@@ -35,13 +35,16 @@ use arca_control::{
 };
 use arca_pipe::{Read, Write};
 
+/// Errno-like code we send to the guest in [`ControlReply::AcceptErr`] when
+/// the request referenced a `listener_id` we don't know about (closest match
+/// to Linux's `EBADF`).
+const ERR_UNKNOWN_LISTENER: u32 = 9;
+
 #[derive(Debug)]
 pub enum MonitorError {
     Io(io::Error),
     Codec(CodecError),
     UnexpectedRequest(MessageType),
-    /// Accept referenced an unknown `listener_id`.
-    UnknownListener(u32),
 }
 
 impl From<io::Error> for MonitorError {
@@ -189,7 +192,23 @@ impl Monitor {
                     written += 1;
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                Err(_) => {}
+                Err(e) => {
+                    // Kernel `accept` failed for a reason other than
+                    // `WouldBlock`. Tell the next waiter on this listener
+                    // instead of dropping the error on the floor.
+                    if let Some(rid) = self
+                        .pending_accepts
+                        .get_mut(&lid)
+                        .and_then(|q| q.pop_front())
+                    {
+                        let reply = ControlReply::AcceptErr {
+                            request_id: rid,
+                            code: io_err_code(&e),
+                        };
+                        write_frame(transport, &reply.to_frame())?;
+                        written += 1;
+                    }
+                }
             }
         }
         Ok(written)
@@ -216,7 +235,12 @@ impl Monitor {
                 listener_id,
             } => {
                 if !self.listeners.contains_key(&listener_id) {
-                    return Err(MonitorError::UnknownListener(listener_id));
+                    let reply = ControlReply::AcceptErr {
+                        request_id,
+                        code: ERR_UNKNOWN_LISTENER,
+                    };
+                    write_frame(transport, &reply.to_frame())?;
+                    return Ok(());
                 }
                 self.pending_accepts
                     .entry(listener_id)
@@ -329,6 +353,57 @@ mod tests {
             self.outbound.extend_from_slice(buf);
             Ok(buf.len())
         }
+    }
+
+    #[test]
+    fn accept_for_unknown_listener_replies_with_accept_err() {
+        use arca_control::write_frame;
+        let mut m = Monitor::new(64);
+
+        // Accept on a listener_id we never handed out.
+        let acc = ControlRequest::Accept {
+            request_id: 55,
+            listener_id: 999,
+        }
+        .to_frame();
+        let mut enc = VecWriter(Vec::new());
+        write_frame(&mut enc, &acc).unwrap();
+
+        let mut transport = QueuePipe {
+            inbound: std::collections::VecDeque::from(enc.0),
+            outbound: Vec::new(),
+        };
+        m.pump_once(&mut transport).unwrap();
+
+        // Monitor should have written an AcceptErr frame back to the guest.
+        struct SliceReader<'a> {
+            data: &'a [u8],
+            pos: usize,
+        }
+        impl PipeRead for SliceReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> Result<usize, PipeError> {
+                if self.pos >= self.data.len() {
+                    return Err(PipeError::WouldBlock);
+                }
+                let n = std::cmp::min(buf.len(), self.data.len() - self.pos);
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+        let mut r = SliceReader {
+            data: &transport.outbound,
+            pos: 0,
+        };
+        let fr = read_frame(&mut r).unwrap();
+        let ControlReply::AcceptErr {
+            request_id: 55,
+            code,
+        } = ControlReply::try_from(&fr).unwrap()
+        else {
+            panic!("expected AcceptErr(rid=55)");
+        };
+        assert_eq!(code, ERR_UNKNOWN_LISTENER);
     }
 
     #[test]

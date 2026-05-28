@@ -110,6 +110,12 @@ pub enum ControlReply {
         request_id: u32,
         ready: ConnectionReady,
     },
+    /// Monitor couldn't fulfil an `AcceptRequest` (unknown listener, kernel
+    /// accept failed). `code` is an errno-like value.
+    AcceptErr {
+        request_id: u32,
+        code: u32,
+    },
 }
 
 impl ControlReply {
@@ -120,7 +126,8 @@ impl ControlReply {
             | Self::ListenErr { request_id, .. }
             | Self::ConnectOk { request_id, .. }
             | Self::ConnectErr { request_id, .. }
-            | Self::AcceptOk { request_id, .. } => *request_id,
+            | Self::AcceptOk { request_id, .. }
+            | Self::AcceptErr { request_id, .. } => *request_id,
         }
     }
 
@@ -132,6 +139,7 @@ impl ControlReply {
             Self::ConnectOk { .. } => MessageType::ConnectOk,
             Self::ConnectErr { .. } => MessageType::ConnectErr,
             Self::AcceptOk { .. } => MessageType::IncomingConnection,
+            Self::AcceptErr { .. } => MessageType::AcceptErr,
         }
     }
 
@@ -140,9 +148,9 @@ impl ControlReply {
         let mut pl = [0u8; MAX_FRAME_PAYLOAD];
         let n = match self {
             Self::ListenOk { listener_id, .. } => write_u32(&mut pl, *listener_id),
-            Self::ListenErr { code, .. } | Self::ConnectErr { code, .. } => {
-                write_u32(&mut pl, *code)
-            }
+            Self::ListenErr { code, .. }
+            | Self::ConnectErr { code, .. }
+            | Self::AcceptErr { code, .. } => write_u32(&mut pl, *code),
             Self::ConnectOk { ready, .. } | Self::AcceptOk { ready, .. } => {
                 write_ready(&mut pl, ready)
             }
@@ -176,6 +184,10 @@ impl TryFrom<&ControlFrame> for ControlReply {
             MessageType::IncomingConnection => Self::AcceptOk {
                 request_id,
                 ready: read_ready(f.payload())?,
+            },
+            MessageType::AcceptErr => Self::AcceptErr {
+                request_id,
+                code: read_u32(f.payload())?,
             },
             other => return Err(CodecError::UnexpectedMessage(other)),
         })
@@ -290,6 +302,10 @@ mod tests {
             ControlReply::AcceptOk {
                 request_id: 5,
                 ready: sample_ready(),
+            },
+            ControlReply::AcceptErr {
+                request_id: 6,
+                code: 9,
             },
         ] {
             let frame = reply.to_frame();
