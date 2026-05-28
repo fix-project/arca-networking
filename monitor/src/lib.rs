@@ -3,8 +3,8 @@
 //!
 //! Architecture in one paragraph:
 //!
-//! - The monitor owns one [`TcpListener`] per `ListenerReady` it has handed
-//!   out, and one [`TcpStream`] per live connection.
+//! - The monitor owns one [`TcpListener`] per `ControlReply::ListenOk` it
+//!   has handed out, and one [`TcpStream`] per live connection.
 //! - Listeners are kept **non-blocking** so [`Monitor::poll_accepts`] can probe
 //!   the kernel when Arca has queued an accept wait, without wedging the I/O
 //!   thread when no TCP peer is ready yet.
@@ -30,8 +30,8 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 
 use arca_control::{
-    write_frame, AcceptListenerId, CodecError, ConnectionReady, ControlFrame, DataPipeInfo,
-    Endpoint, ErrPayload, FrameReadBuf, ListenerReady, MessageType,
+    write_frame, CodecError, ConnectionReady, ControlFrame, ControlReply, ControlRequest,
+    DataPipeInfo, FrameReadBuf, MessageType,
 };
 use arca_pipe::{Read, Write};
 
@@ -93,35 +93,38 @@ impl Monitor {
     /// [`MessageType::ConnectRequest`]. [`MessageType::AcceptRequest`] is
     /// handled in [`Monitor::handle_control_frame`].
     pub fn dispatch_request(&mut self, frame: ControlFrame) -> Result<ControlFrame, MonitorError> {
-        let rid = frame.request_id;
-        match frame.message_type {
-            MessageType::ListenRequest => {
-                let ep = Endpoint::decode(frame.payload());
-                let addr = SocketAddr::from((Ipv4Addr::from(ep.host), ep.port));
-                match TcpListener::bind(addr) {
+        let request = ControlRequest::try_from(&frame)?;
+        let rid = request.request_id();
+        match request {
+            ControlRequest::Listen { endpoint, .. } => {
+                let addr = SocketAddr::from((Ipv4Addr::from(endpoint.host), endpoint.port));
+                let reply = match TcpListener::bind(addr) {
                     Ok(listener) => {
                         listener.set_nonblocking(true)?;
                         let id = self.alloc_listener_id();
                         self.listeners.insert(id, listener);
-                        let mut pl = [0u8; 4];
-                        ListenerReady { listener_id: id }.encode(&mut pl);
-                        Ok(ControlFrame::new(MessageType::ListenOk, rid, &pl))
+                        ControlReply::ListenOk {
+                            request_id: rid,
+                            listener_id: id,
+                        }
                     }
-                    Err(e) => Ok(err_frame(MessageType::ListenErr, rid, io_err_code(&e))),
-                }
+                    Err(e) => ControlReply::ListenErr {
+                        request_id: rid,
+                        code: io_err_code(&e),
+                    },
+                };
+                Ok(reply.to_frame())
             }
-            MessageType::ConnectRequest => {
-                let ep = Endpoint::decode(frame.payload());
-                let addr = SocketAddr::from((Ipv4Addr::from(ep.host), ep.port));
+            ControlRequest::Connect { endpoint, .. } => {
+                let addr = SocketAddr::from((Ipv4Addr::from(endpoint.host), endpoint.port));
                 // Blocks until the kernel handshake completes — “connect waits”.
-                match TcpStream::connect(addr) {
+                let reply = match TcpStream::connect(addr) {
                     Ok(stream) => {
                         let id = self.alloc_connection_id();
                         self.connections.insert(id, stream);
-                        Ok(ready_frame(
-                            MessageType::ConnectOk,
-                            rid,
-                            ConnectionReady {
+                        ControlReply::ConnectOk {
+                            request_id: rid,
+                            ready: ConnectionReady {
                                 listener_id: 0,
                                 connection_id: id,
                                 // TODO: allocate real SHM region of size
@@ -129,15 +132,18 @@ impl Monitor {
                                 // and pass the returned handle here instead of `id as u64`.
                                 pipe: DataPipeInfo::new(id as u64, self.default_ring_size),
                             },
-                        ))
+                        }
                     }
-                    Err(e) => Ok(err_frame(MessageType::ConnectErr, rid, io_err_code(&e))),
-                }
+                    Err(e) => ControlReply::ConnectErr {
+                        request_id: rid,
+                        code: io_err_code(&e),
+                    },
+                };
+                Ok(reply.to_frame())
             }
-            MessageType::AcceptRequest => Err(MonitorError::UnexpectedRequest(
-                MessageType::AcceptRequest,
-            )),
-            other => Err(MonitorError::UnexpectedRequest(other)),
+            ControlRequest::Accept { .. } => {
+                Err(MonitorError::UnexpectedRequest(MessageType::AcceptRequest))
+            }
         }
     }
 
@@ -168,10 +174,9 @@ impl Monitor {
                     };
                     let cid = self.alloc_connection_id();
                     self.connections.insert(cid, stream);
-                    let fr = ready_frame(
-                        MessageType::IncomingConnection,
-                        rid,
-                        ConnectionReady {
+                    let reply = ControlReply::AcceptOk {
+                        request_id: rid,
+                        ready: ConnectionReady {
                             listener_id: lid,
                             connection_id: cid,
                             // TODO: allocate real SHM region of size
@@ -179,8 +184,8 @@ impl Monitor {
                             // and pass the returned handle here instead of `cid as u64`.
                             pipe: DataPipeInfo::new(cid as u64, self.default_ring_size),
                         },
-                    );
-                    write_frame(transport, &fr)?;
+                    };
+                    write_frame(transport, &reply.to_frame())?;
                     written += 1;
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {}
@@ -205,16 +210,18 @@ impl Monitor {
         transport: &mut T,
         frame: ControlFrame,
     ) -> Result<(), MonitorError> {
-        match frame.message_type {
-            MessageType::AcceptRequest => {
-                let lid = AcceptListenerId::decode(frame.payload()).listener_id;
-                if !self.listeners.contains_key(&lid) {
-                    return Err(MonitorError::UnknownListener(lid));
+        match ControlRequest::try_from(&frame)? {
+            ControlRequest::Accept {
+                request_id,
+                listener_id,
+            } => {
+                if !self.listeners.contains_key(&listener_id) {
+                    return Err(MonitorError::UnknownListener(listener_id));
                 }
                 self.pending_accepts
-                    .entry(lid)
+                    .entry(listener_id)
                     .or_default()
-                    .push_back(frame.request_id);
+                    .push_back(request_id);
                 self.poll_accepts(transport)?;
                 Ok(())
             }
@@ -279,22 +286,10 @@ impl Monitor {
     }
 }
 
-fn err_frame(kind: MessageType, rid: u32, code: u32) -> ControlFrame {
-    let mut pl = [0u8; 4];
-    ErrPayload { code }.encode(&mut pl);
-    ControlFrame::new(kind, rid, &pl)
-}
-
-fn ready_frame(kind: MessageType, rid: u32, ready: ConnectionReady) -> ControlFrame {
-    let mut pl = [0u8; 24];
-    ready.encode(&mut pl);
-    ControlFrame::new(kind, rid, &pl)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arca_control::read_frame;
+    use arca_control::{read_frame, Endpoint};
     use arca_pipe::{PipeError, Read as PipeRead, Write as PipeWrite};
     use std::io::{Read as IoRead, Write as IoWrite};
     use std::sync::mpsc;
@@ -338,23 +333,25 @@ mod tests {
 
     #[test]
     fn pump_once_reads_accept_request_then_tcp_pairs_request_id() {
-        use arca_control::{write_frame, AcceptListenerId, ControlFrame};
+        use arca_control::write_frame;
         let mut m = Monitor::new(64);
-        let bind_ep = Endpoint::new([127, 0, 0, 1], 0);
-        let mut pl = [0u8; arca_control::MAX_FRAME_PAYLOAD];
-        let n = bind_ep.encode(&mut pl);
-        let reply = m
-            .dispatch_request(ControlFrame::new(
-                MessageType::ListenRequest,
-                1,
-                &pl[..n],
-            ))
-            .unwrap();
-        let lid = ListenerReady::decode(reply.payload()).listener_id;
+        let listen = ControlRequest::Listen {
+            request_id: 1,
+            endpoint: Endpoint::new([127, 0, 0, 1], 0),
+        };
+        let reply = m.dispatch_request(listen.to_frame()).unwrap();
+        let ControlReply::ListenOk {
+            listener_id: lid, ..
+        } = ControlReply::try_from(&reply).unwrap()
+        else {
+            panic!("expected ListenOk");
+        };
 
-        let mut pay = [0u8; 4];
-        AcceptListenerId { listener_id: lid }.encode(&mut pay);
-        let acc = ControlFrame::new(MessageType::AcceptRequest, 77, &pay);
+        let acc = ControlRequest::Accept {
+            request_id: 77,
+            listener_id: lid,
+        }
+        .to_frame();
         let mut enc = VecWriter(Vec::new());
         write_frame(&mut enc, &acc).unwrap();
 
@@ -394,29 +391,35 @@ mod tests {
                 Ok(n)
             }
         }
-        let mut r = FrameSliceReader {
-            data: &w.0,
-            pos: 0,
-        };
+        let mut r = FrameSliceReader { data: &w.0, pos: 0 };
         let fr = read_frame(&mut r).unwrap();
-        assert_eq!(fr.message_type, MessageType::IncomingConnection);
-        assert_eq!(fr.request_id, 77);
-        let ready = ConnectionReady::decode(fr.payload());
+        let ControlReply::AcceptOk {
+            request_id: 77,
+            ready,
+        } = ControlReply::try_from(&fr).unwrap()
+        else {
+            panic!("expected AcceptOk(rid=77)");
+        };
         assert_eq!(ready.listener_id, lid);
     }
 
     #[test]
     fn listen_dispatch_binds() {
         let mut m = Monitor::new(64);
-        let ep = Endpoint::new([127, 0, 0, 1], 0);
-        let mut pl = [0u8; arca_control::MAX_FRAME_PAYLOAD];
-        let n = ep.encode(&mut pl);
-        let req = ControlFrame::new(MessageType::ListenRequest, 7, &pl[..n]);
+        let req = ControlRequest::Listen {
+            request_id: 7,
+            endpoint: Endpoint::new([127, 0, 0, 1], 0),
+        }
+        .to_frame();
         let reply = m.dispatch_request(req).unwrap();
-        assert_eq!(reply.message_type, MessageType::ListenOk);
-        assert_eq!(reply.request_id, 7);
-        let lr = ListenerReady::decode(reply.payload());
-        assert!(m.listeners.contains_key(&lr.listener_id));
+        let ControlReply::ListenOk {
+            request_id: 7,
+            listener_id,
+        } = ControlReply::try_from(&reply).unwrap()
+        else {
+            panic!("expected ListenOk(rid=7)");
+        };
+        assert!(m.listeners.contains_key(&listener_id));
     }
 
     #[test]
@@ -436,13 +439,15 @@ mod tests {
 
         let port = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let mut m = Monitor::new(64);
-        let ep = Endpoint::new([127, 0, 0, 1], port);
-        let mut pl = [0u8; arca_control::MAX_FRAME_PAYLOAD];
-        let n = ep.encode(&mut pl);
-        let req = ControlFrame::new(MessageType::ConnectRequest, 1, &pl[..n]);
+        let req = ControlRequest::Connect {
+            request_id: 1,
+            endpoint: Endpoint::new([127, 0, 0, 1], port),
+        }
+        .to_frame();
         let reply = m.dispatch_request(req).unwrap();
-        assert_eq!(reply.message_type, MessageType::ConnectOk);
-        let ready = ConnectionReady::decode(reply.payload());
+        let ControlReply::ConnectOk { ready, .. } = ControlReply::try_from(&reply).unwrap() else {
+            panic!("expected ConnectOk");
+        };
         let stream = m.connection(ready.connection_id).unwrap();
         let mut owned = stream.try_clone().unwrap();
         owned.write_all(b"ping").unwrap();
@@ -456,12 +461,18 @@ mod tests {
     #[test]
     fn incoming_after_client_connects() {
         let mut m = Monitor::new(64);
-        let bind_ep = Endpoint::new([127, 0, 0, 1], 0);
-        let mut pl = [0u8; arca_control::MAX_FRAME_PAYLOAD];
-        let n = bind_ep.encode(&mut pl);
-        let req = ControlFrame::new(MessageType::ListenRequest, 1, &pl[..n]);
+        let req = ControlRequest::Listen {
+            request_id: 1,
+            endpoint: Endpoint::new([127, 0, 0, 1], 0),
+        }
+        .to_frame();
         let reply = m.dispatch_request(req).unwrap();
-        let lid = ListenerReady::decode(reply.payload()).listener_id;
+        let ControlReply::ListenOk {
+            listener_id: lid, ..
+        } = ControlReply::try_from(&reply).unwrap()
+        else {
+            panic!("expected ListenOk");
+        };
         let port = m.listeners.get(&lid).unwrap().local_addr().unwrap().port();
         m.test_enqueue_accept(lid, 42);
 
@@ -492,14 +503,15 @@ mod tests {
             }
         }
 
-        let mut r = SliceReader {
-            data: &w.0,
-            pos: 0,
-        };
+        let mut r = SliceReader { data: &w.0, pos: 0 };
         let ev = read_frame(&mut r).unwrap();
-        assert_eq!(ev.message_type, MessageType::IncomingConnection);
-        assert_eq!(ev.request_id, 42);
-        let ready = ConnectionReady::decode(ev.payload());
+        let ControlReply::AcceptOk {
+            request_id: 42,
+            ready,
+        } = ControlReply::try_from(&ev).unwrap()
+        else {
+            panic!("expected AcceptOk(rid=42)");
+        };
         assert_eq!(ready.listener_id, lid);
     }
 

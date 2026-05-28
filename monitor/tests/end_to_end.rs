@@ -140,14 +140,16 @@ fn arca_bind_then_accept_after_external_connect() {
         let mut m = Monitor::new(64);
 
         // 1. Read the bind request, dispatch, peek the bound port, write reply.
-        use arca_control::{
-            read_frame, write_frame, ListenerReady, MessageType,
-        };
+        use arca_control::{read_frame, write_frame, ControlReply, MessageType};
         let req = read_frame(&mut mon_end).unwrap();
         assert_eq!(req.message_type, MessageType::ListenRequest);
         let reply = m.dispatch_request(req).unwrap();
-        assert_eq!(reply.message_type, MessageType::ListenOk);
-        let lid = ListenerReady::decode(reply.payload()).listener_id;
+        let ControlReply::ListenOk {
+            listener_id: lid, ..
+        } = ControlReply::try_from(&reply).unwrap()
+        else {
+            panic!("expected ListenOk");
+        };
         let port = m
             .listener(lid)
             .expect("listener should exist after dispatch")

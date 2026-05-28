@@ -18,8 +18,10 @@
 
 mod arca_side;
 mod codec;
+mod message;
 pub mod protocol;
 
 pub use arca_side::{ArcaError, ArcaSession, ArcaTcpListener, ArcaTcpStream};
-pub use codec::{read_frame, write_frame, CodecError, FrameReadBuf, HEADER_LEN, MAX_WIRE_FRAME_LEN};
+pub use codec::{read_frame, write_frame, FrameReadBuf, HEADER_LEN, MAX_WIRE_FRAME_LEN};
+pub use message::{ControlReply, ControlRequest};
 pub use protocol::*;

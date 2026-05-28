@@ -4,7 +4,7 @@
 
 use arca_pipe::{PipeError, Read, Write};
 
-use crate::{ControlFrame, MessageType, MAX_FRAME_PAYLOAD};
+use crate::{CodecError, ControlFrame, MessageType, MAX_FRAME_PAYLOAD};
 
 /// `message_type` (1) + `payload_len` (2) + `request_id` (4).
 pub const HEADER_LEN: usize = 7;
@@ -17,13 +17,6 @@ fn relax_wait() {
     // Avoid busy-spinning on WouldBlock when multiple threads / the monitor
     // is waiting on the control ring.
     core::hint::spin_loop();
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CodecError {
-    UnknownMessageType(u8),
-    PayloadTooLarge { len: usize },
-    Closed,
 }
 
 pub fn write_frame<T: Write>(transport: &mut T, frame: &ControlFrame) -> Result<(), CodecError> {
@@ -93,8 +86,7 @@ impl FrameReadBuf {
     ) -> Result<Option<ControlFrame>, CodecError> {
         loop {
             if self.len >= HEADER_LEN {
-                let payload_len =
-                    u16::from_le_bytes([self.storage[1], self.storage[2]]) as usize;
+                let payload_len = u16::from_le_bytes([self.storage[1], self.storage[2]]) as usize;
                 if payload_len > MAX_FRAME_PAYLOAD {
                     return Err(CodecError::PayloadTooLarge { len: payload_len });
                 }
@@ -172,10 +164,7 @@ fn read_exact<T: Read>(transport: &mut T, mut dst: &mut [u8]) -> Result<(), Code
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        AcceptListenerId, ConnectionReady, DataPipeInfo, Endpoint, ListenerReady, MessageType,
-        MAX_FRAME_PAYLOAD,
-    };
+    use crate::{MessageType, MAX_FRAME_PAYLOAD};
 
     struct MemPipe<const N: usize> {
         buf: [u8; N],
@@ -228,11 +217,10 @@ mod tests {
     }
 
     #[test]
-    fn write_read_round_trip_endpoint_payload() {
-        let ep = Endpoint::new([127, 0, 0, 1], 8080);
-        let mut pl = [0u8; MAX_FRAME_PAYLOAD];
-        let n = ep.encode(&mut pl);
-        let frame = ControlFrame::new(MessageType::ConnectRequest, 99, &pl[..n]);
+    fn write_read_round_trip_with_payload() {
+        // The codec is payload-agnostic; verify framing identity with raw bytes.
+        let pl: [u8; 6] = [127, 0, 0, 1, 0x90, 0x1f];
+        let frame = ControlFrame::new(MessageType::ConnectRequest, 99, &pl);
 
         let mut pipe = MemPipe::<256>::new();
         write_frame(&mut pipe, &frame).unwrap();
@@ -240,41 +228,7 @@ mod tests {
 
         assert_eq!(got.message_type, MessageType::ConnectRequest);
         assert_eq!(got.request_id, 99);
-        let back = Endpoint::decode(got.payload());
-        assert_eq!(back, ep);
-    }
-
-    #[test]
-    fn write_read_round_trip_listener_ready_payload() {
-        let lr = ListenerReady {
-            listener_id: 0xdead_beef,
-        };
-        let mut pl = [0u8; 4];
-        lr.encode(&mut pl);
-        let frame = ControlFrame::new(MessageType::ListenOk, 1, &pl);
-
-        let mut pipe = MemPipe::<128>::new();
-        write_frame(&mut pipe, &frame).unwrap();
-        let got = read_frame(&mut pipe).unwrap();
-        assert_eq!(got.message_type, MessageType::ListenOk);
-        assert_eq!(ListenerReady::decode(got.payload()).listener_id, lr.listener_id);
-    }
-
-    #[test]
-    fn write_read_round_trip_connection_ready_payload() {
-        let ready = ConnectionReady {
-            listener_id: 0,
-            connection_id: 42,
-            pipe: DataPipeInfo::new(7, 128),
-        };
-        let mut pl = [0u8; 24];
-        ready.encode(&mut pl);
-        let frame = ControlFrame::new(MessageType::ConnectOk, 100, &pl);
-
-        let mut pipe = MemPipe::<256>::new();
-        write_frame(&mut pipe, &frame).unwrap();
-        let got = read_frame(&mut pipe).unwrap();
-        assert_eq!(ConnectionReady::decode(got.payload()), ready);
+        assert_eq!(got.payload(), &pl);
     }
 
     #[test]
@@ -320,24 +274,8 @@ mod tests {
     }
 
     #[test]
-    fn write_read_round_trip_accept_request_payload() {
-        let mut pay = [0u8; 4];
-        AcceptListenerId { listener_id: 42 }.encode(&mut pay);
-        let frame = ControlFrame::new(MessageType::AcceptRequest, 0xbeef_0001, &pay);
-
-        let mut pipe = MemPipe::<256>::new();
-        write_frame(&mut pipe, &frame).unwrap();
-        let got = read_frame(&mut pipe).unwrap();
-
-        assert_eq!(got.message_type, MessageType::AcceptRequest);
-        assert_eq!(got.request_id, 0xbeef_0001);
-        assert_eq!(AcceptListenerId::decode(got.payload()).listener_id, 42);
-    }
-
-    #[test]
     fn frame_read_buf_decodes_back_to_back_frames() {
-        let mut pay = [0u8; 4];
-        AcceptListenerId { listener_id: 7 }.encode(&mut pay);
+        let pay = 7u32.to_le_bytes();
         let a = ControlFrame::new(MessageType::AcceptRequest, 10, &pay);
         let b = ControlFrame::new(MessageType::ListenRequest, 20, &[]);
         let mut pipe = MemPipe::<1024>::new();
@@ -349,7 +287,7 @@ mod tests {
         let f1 = dec.try_read_frame(&mut pipe).unwrap().unwrap();
         assert_eq!(f1.message_type, MessageType::AcceptRequest);
         assert_eq!(f1.request_id, 10);
-        assert_eq!(AcceptListenerId::decode(f1.payload()).listener_id, 7);
+        assert_eq!(f1.payload(), &pay);
 
         let f2 = dec.try_read_frame(&mut pipe).unwrap().unwrap();
         assert_eq!(f2.message_type, MessageType::ListenRequest);
@@ -360,8 +298,7 @@ mod tests {
 
     #[test]
     fn frame_read_buf_one_byte_at_a_time() {
-        let mut pay = [0u8; 4];
-        AcceptListenerId { listener_id: 3 }.encode(&mut pay);
+        let pay = 3u32.to_le_bytes();
         let frame = ControlFrame::new(MessageType::AcceptRequest, 99, &pay);
         let mut wire = MemPipe::<256>::new();
         write_frame(&mut wire, &frame).unwrap();
@@ -398,6 +335,6 @@ mod tests {
         let got = decoded.expect("should decode after enough bytes");
         assert_eq!(got.message_type, MessageType::AcceptRequest);
         assert_eq!(got.request_id, 99);
-        assert_eq!(AcceptListenerId::decode(got.payload()).listener_id, 3);
+        assert_eq!(got.payload(), &pay);
     }
 }
