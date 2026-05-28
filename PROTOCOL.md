@@ -12,8 +12,9 @@ All Linux→Arca control traffic is **replies**: each frame echoes Arca’s
 Outbound connect uses `ConnectRequest` and `ConnectOk` or `ConnectErr`; the
 monitor waits on `TcpStream::connect` until the handshake completes.
 Inbound connections use `AcceptRequest` (message type 8): Arca waits for
-`IncomingConnection`, which is sent **only** in reply to that request with
-the same `request_id`. The monitor keeps a pending-accept queue per
+`IncomingConnection` (success) or `AcceptErr` (unknown listener or kernel
+`accept` failed), each sent **only** in reply to that request with the
+same `request_id`. The monitor keeps a pending-accept queue per
 listener, calls kernel `accept` only when a wait exists, and drives the pipe
 with `poll_accepts`, `pump_once`, `serve_one`, and `FrameReadBuf` when the
 transport is non-blocking. `ArcaSession` matches replies by `request_id`
@@ -180,6 +181,7 @@ new message type or an extra header byte.
 | 6    | `ListenErr`          | Linux → Arca | `ErrPayload` (4 B)    | Reply to `ListenRequest`. |
 | 7    | `ConnectErr`         | Linux → Arca | `ErrPayload` (4 B)    | Reply to `ConnectRequest`. |
 | 8    | `AcceptRequest`      | Arca → Linux | `AcceptListenerId` (4 B) | Wait for next inbound on this `listener_id` (see §5). |
+| 9    | `AcceptErr`          | Linux → Arca | `ErrPayload` (4 B)    | Reply to `AcceptRequest` when the monitor can't fulfil it (unknown listener, kernel `accept` failed). `code` is errno-like; `9` (EBADF) for unknown listener. |
 
 ### Payload layouts
 
@@ -448,18 +450,15 @@ In rough priority order, things this iteration intentionally doesn't do:
 3. **IPv6.** `Endpoint` is fixed at 4 octets. When IPv6 lands, either
    add a sibling type or change `Endpoint` to a length-prefixed form
    (which would be the first wire-incompatible change).
-4. **Rich error replies for `AcceptRequest`** (unknown listener today maps
-   to `MonitorError::UnknownListener` on the monitor side; Arca has no
-   `AcceptErr` frame yet).
-5. **Backpressure on the control pipe.** The codec spins on `WouldBlock`.
+4. **Backpressure on the control pipe.** The codec spins on `WouldBlock`.
    That's fine when traffic is low; under load we want a proper readiness
    mechanism (epoll-style on Linux side, signaling primitive on Arca).
-6. **ID reuse / cleanup.** Listener and connection IDs leak monotonically
+5. **ID reuse / cleanup.** Listener and connection IDs leak monotonically
    today.
-7. **Linux→Arca data-pipe allocator integration.** The `pipe_id` field
+6. **Linux→Arca data-pipe allocator integration.** The `pipe_id` field
    is currently just `connection_id`; real allocation needs a SHM
    manager that hands out distinct pipe regions.
-8. **Shared file mapping** (notes file): "ask Linux to open `path`,
+7. **Shared file mapping** (notes file): "ask Linux to open `path`,
    return a pointer/length into shared memory." Same control/data split
    as TCP, different verb. Easy follow-on once the existing path is
    solid.

@@ -24,22 +24,34 @@
 use arca_pipe::{Read, Write};
 
 use crate::{
-    read_frame, write_frame, AcceptListenerId, CodecError, ConnectionReady, ControlFrame,
-    DataPipeInfo, Endpoint, ErrPayload, ListenerReady, MessageType, MAX_FRAME_PAYLOAD,
+    read_frame, write_frame, CodecError, ConnectionReady, ControlReply, ControlRequest,
+    DataPipeInfo, Endpoint, MessageType,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArcaError {
     Codec(CodecError),
     /// Linux returned `ListenErr` with the given errno-like code.
-    ListenFailed { code: u32 },
+    ListenFailed {
+        code: u32,
+    },
     /// Linux returned `ConnectErr` with the given errno-like code.
-    ConnectFailed { code: u32 },
+    ConnectFailed {
+        code: u32,
+    },
+    /// Linux returned `AcceptErr` with the given errno-like code (unknown
+    /// listener, or kernel `accept` failed on the monitor side).
+    AcceptFailed {
+        code: u32,
+    },
     /// Got a frame we weren't expecting — protocol bug or out-of-sync state.
     UnexpectedReply(MessageType),
     /// Reply came back with a `request_id` we didn't issue (wrong order on
     /// this transport, or another thread's reply).
-    UnexpectedRequestId { expected: u32, got: u32 },
+    UnexpectedRequestId {
+        expected: u32,
+        got: u32,
+    },
 }
 
 impl From<CodecError> for ArcaError {
@@ -116,96 +128,73 @@ impl<'a, T: Read + Write> ArcaSession<'a, T> {
 
     /// Ask Linux to bind+listen on `ep`. Returns a handle on success.
     pub fn bind(&mut self, ep: Endpoint) -> Result<ArcaTcpListener, ArcaError> {
-        let rid = self.alloc_request_id();
-        let mut pl = [0u8; MAX_FRAME_PAYLOAD];
-        let n = ep.encode(&mut pl);
+        let request_id = self.alloc_request_id();
         write_frame(
             self.transport,
-            &ControlFrame::new(MessageType::ListenRequest, rid, &pl[..n]),
+            &ControlRequest::Listen {
+                request_id,
+                endpoint: ep,
+            }
+            .to_frame(),
         )?;
 
-        let reply = self.read_reply_for(rid)?;
-        match reply.message_type {
-            MessageType::ListenOk => Ok(ArcaTcpListener {
-                listener_id: ListenerReady::decode(reply.payload()).listener_id,
-            }),
-            MessageType::ListenErr => Err(ArcaError::ListenFailed {
-                code: ErrPayload::decode(reply.payload()).code,
-            }),
-            other => Err(ArcaError::UnexpectedReply(other)),
+        match self.read_reply_for(request_id)? {
+            ControlReply::ListenOk { listener_id, .. } => Ok(ArcaTcpListener { listener_id }),
+            ControlReply::ListenErr { code, .. } => Err(ArcaError::ListenFailed { code }),
+            other => Err(ArcaError::UnexpectedReply(other.message_type())),
         }
     }
 
     /// Ask Linux to connect outbound to `ep`. Returns a handle on success.
     pub fn connect(&mut self, ep: Endpoint) -> Result<ArcaTcpStream, ArcaError> {
-        let rid = self.alloc_request_id();
-        let mut pl = [0u8; MAX_FRAME_PAYLOAD];
-        let n = ep.encode(&mut pl);
+        let request_id = self.alloc_request_id();
         write_frame(
             self.transport,
-            &ControlFrame::new(MessageType::ConnectRequest, rid, &pl[..n]),
+            &ControlRequest::Connect {
+                request_id,
+                endpoint: ep,
+            }
+            .to_frame(),
         )?;
 
-        let reply = self.read_reply_for(rid)?;
-        match reply.message_type {
-            MessageType::ConnectOk => {
-                let ready = ConnectionReady::decode(reply.payload());
-                Ok(ArcaTcpStream {
-                    listener_id: ready.listener_id,
-                    connection_id: ready.connection_id,
-                    pipe: ready.pipe,
-                })
-            }
-            MessageType::ConnectErr => Err(ArcaError::ConnectFailed {
-                code: ErrPayload::decode(reply.payload()).code,
-            }),
-            other => Err(ArcaError::UnexpectedReply(other)),
+        match self.read_reply_for(request_id)? {
+            ControlReply::ConnectOk { ready, .. } => Ok(stream_from_ready(ready)),
+            ControlReply::ConnectErr { code, .. } => Err(ArcaError::ConnectFailed { code }),
+            other => Err(ArcaError::UnexpectedReply(other.message_type())),
         }
     }
 
     /// Wait for the next inbound connection on `listener`.
     ///
-    /// Sends [`MessageType::AcceptRequest`] and blocks until Linux replies
-    /// with [`MessageType::IncomingConnection`] for the same `request_id`.
+    /// Sends [`ControlRequest::Accept`] and blocks until Linux replies with a
+    /// [`ControlReply::AcceptOk`] for the same `request_id`.
     pub fn accept(&mut self, listener: &ArcaTcpListener) -> Result<ArcaTcpStream, ArcaError> {
-        let rid = self.alloc_request_id();
-        let mut pay = [0u8; 4];
-        AcceptListenerId {
-            listener_id: listener.listener_id,
-        }
-        .encode(&mut pay);
+        let request_id = self.alloc_request_id();
         write_frame(
             self.transport,
-            &ControlFrame::new(MessageType::AcceptRequest, rid, &pay[..4]),
+            &ControlRequest::Accept {
+                request_id,
+                listener_id: listener.listener_id,
+            }
+            .to_frame(),
         )?;
 
-        let reply = self.read_reply_for(rid)?;
-        match reply.message_type {
-            MessageType::IncomingConnection => Ok(stream_from_ready(ConnectionReady::decode(
-                reply.payload(),
-            ))),
-            other => Err(ArcaError::UnexpectedReply(other)),
+        match self.read_reply_for(request_id)? {
+            ControlReply::AcceptOk { ready, .. } => Ok(stream_from_ready(ready)),
+            ControlReply::AcceptErr { code, .. } => Err(ArcaError::AcceptFailed { code }),
+            other => Err(ArcaError::UnexpectedReply(other.message_type())),
         }
     }
 
-    fn read_reply_for(&mut self, expected_rid: u32) -> Result<ControlFrame, ArcaError> {
-        loop {
-            let frame = read_frame(self.transport)?;
-            if frame.request_id != expected_rid {
-                return Err(ArcaError::UnexpectedRequestId {
-                    expected: expected_rid,
-                    got: frame.request_id,
-                });
-            }
-            match frame.message_type {
-                MessageType::ListenOk
-                | MessageType::ListenErr
-                | MessageType::ConnectOk
-                | MessageType::ConnectErr
-                | MessageType::IncomingConnection => return Ok(frame),
-                other => return Err(ArcaError::UnexpectedReply(other)),
-            }
+    fn read_reply_for(&mut self, expected_rid: u32) -> Result<ControlReply, ArcaError> {
+        let reply = ControlReply::try_from(&read_frame(self.transport)?)?;
+        if reply.request_id() != expected_rid {
+            return Err(ArcaError::UnexpectedRequestId {
+                expected: expected_rid,
+                got: reply.request_id(),
+            });
         }
+        Ok(reply)
     }
 }
 
@@ -220,7 +209,7 @@ fn stream_from_ready(ready: ConnectionReady) -> ArcaTcpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DataPipeInfo, MessageType};
+    use crate::{ControlFrame, DataPipeInfo, MessageType};
     use arca_pipe::PipeError;
 
     /// In-memory transport for tests: writes append, reads pop from front.
@@ -286,21 +275,27 @@ mod tests {
     }
 
     fn listen_ok(rid: u32, listener_id: u32) -> ControlFrame {
-        let mut pl = [0u8; 4];
-        ListenerReady { listener_id }.encode(&mut pl);
-        ControlFrame::new(MessageType::ListenOk, rid, &pl)
+        ControlReply::ListenOk {
+            request_id: rid,
+            listener_id,
+        }
+        .to_frame()
     }
 
     fn connect_ok(rid: u32, ready: ConnectionReady) -> ControlFrame {
-        let mut pl = [0u8; 24];
-        ready.encode(&mut pl);
-        ControlFrame::new(MessageType::ConnectOk, rid, &pl)
+        ControlReply::ConnectOk {
+            request_id: rid,
+            ready,
+        }
+        .to_frame()
     }
 
     fn incoming(rid: u32, ready: ConnectionReady) -> ControlFrame {
-        let mut pl = [0u8; 24];
-        ready.encode(&mut pl);
-        ControlFrame::new(MessageType::IncomingConnection, rid, &pl)
+        ControlReply::AcceptOk {
+            request_id: rid,
+            ready,
+        }
+        .to_frame()
     }
 
     #[test]
@@ -363,24 +358,46 @@ mod tests {
             pos: 0,
         };
         let req = read_frame(&mut reader).unwrap();
-        assert_eq!(req.message_type, MessageType::AcceptRequest);
-        assert_eq!(req.request_id, 1);
         assert_eq!(
-            AcceptListenerId::decode(req.payload()).listener_id,
-            5
+            ControlRequest::try_from(&req).unwrap(),
+            ControlRequest::Accept {
+                request_id: 1,
+                listener_id: 5
+            }
         );
     }
 
     #[test]
     fn listen_failure_propagates_errno() {
         let mut t = MemTransport::new();
-        let mut pl = [0u8; 4];
-        ErrPayload { code: 98 }.encode(&mut pl);
-        t.push_inbound(&ControlFrame::new(MessageType::ListenErr, 1, &pl));
+        t.push_inbound(
+            &ControlReply::ListenErr {
+                request_id: 1,
+                code: 98,
+            }
+            .to_frame(),
+        );
 
         let mut s = ArcaSession::new(&mut t);
         let err = s.bind(Endpoint::new([0, 0, 0, 0], 1)).unwrap_err();
         assert_eq!(err, ArcaError::ListenFailed { code: 98 });
+    }
+
+    #[test]
+    fn accept_failure_propagates_errno() {
+        let mut t = MemTransport::new();
+        t.push_inbound(
+            &ControlReply::AcceptErr {
+                request_id: 1,
+                code: 9,
+            }
+            .to_frame(),
+        );
+
+        let mut s = ArcaSession::new(&mut t);
+        let listener = ArcaTcpListener { listener_id: 99 };
+        let err = s.accept(&listener).unwrap_err();
+        assert_eq!(err, ArcaError::AcceptFailed { code: 9 });
     }
 
     struct SliceReader<'a> {
