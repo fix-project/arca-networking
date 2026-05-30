@@ -1,13 +1,16 @@
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Header for a single SPSC ring buffer, stored in shared memory.
 ///
 /// Cursors are monotonically increasing logical offsets. Physical positions
-/// are `cursor % ring_size`.
+/// are `cursor % ring_size`. The close flags signal orderly shutdown: the
+/// producer sets `writer_closed`; the consumer sets `reader_closed`.
 #[repr(C)]
 pub struct RingHeader {
     pub read_cursor: AtomicU64,
     pub write_cursor: AtomicU64,
+    pub writer_closed: AtomicBool,
+    pub reader_closed: AtomicBool,
 }
 
 impl RingHeader {
@@ -98,6 +101,8 @@ mod tests {
         RingHeader {
             read_cursor: AtomicU64::new(read),
             write_cursor: AtomicU64::new(write),
+            writer_closed: AtomicBool::new(false),
+            reader_closed: AtomicBool::new(false),
         }
     }
 

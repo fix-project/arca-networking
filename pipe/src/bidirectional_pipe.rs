@@ -62,14 +62,34 @@ impl<'a> BidirectionalPipe<'a> {
         Self { writer, reader }
     }
 
-    /// Bytes this side wrote that the other side has not yet read.
-    pub fn outgoing_bytes_remaining(&self) -> u64 {
-        self.writer.bytes_pending()
-    }
-
     /// Split into independent read and write halves (like `TcpStream::split`).
     pub fn split(&mut self) -> (&mut RingConsumer<'a>, &mut RingProducer<'a>) {
         (&mut self.reader, &mut self.writer)
+    }
+
+    /// Close this side's outgoing (write) direction.
+    pub fn close_write(&self) {
+        self.writer.close_writer();
+    }
+
+    /// Close this side's incoming (read) direction.
+    pub fn close_read(&self) {
+        self.reader.close_reader();
+    }
+
+    /// True if the peer has closed their write side (no more data incoming).
+    pub fn is_peer_write_closed(&self) -> bool {
+        self.reader.is_writer_closed()
+    }
+
+    /// True if the peer has closed their read side (they will not read more data we send).
+    pub fn is_peer_read_closed(&self) -> bool {
+        self.writer.is_reader_closed()
+    }
+
+    /// True when both unidirectional rings are fully closed (all four flags set).
+    pub fn is_closed(&self) -> bool {
+        self.writer.is_closed() && self.reader.is_closed()
     }
 }
 
@@ -95,7 +115,7 @@ mod tests {
 
     macro_rules! pipe_pair {
         ($ring:expr, $mem:ident, $a:ident, $b:ident) => {
-            let mut $mem = Aligned([0u8; 2 * (16 + $ring)]);
+            let mut $mem = Aligned([0u8; BidirectionalPipe::required_size($ring as u64) as usize]);
             let region = unsafe {
                 SharedMemoryRegion::from_raw($mem.0.as_mut_ptr(), $mem.0.len() as u64)
             };
@@ -106,7 +126,7 @@ mod tests {
 
     #[test]
     fn required_size_matches_layout() {
-        assert_eq!(BidirectionalPipe::required_size(64), 2 * (16 + 64));
+        assert_eq!(BidirectionalPipe::required_size(64), 2 * (24 + 64));
     }
 
     #[test]
@@ -180,21 +200,4 @@ mod tests {
         assert_eq!(&out, b"bbdd");
     }
 
-    #[test]
-    fn outgoing_bytes_after_read () {
-        pipe_pair!(32, mem, a, b);
-        assert_eq!(a.outgoing_bytes_remaining(), 0);
-        assert_eq!(b.outgoing_bytes_remaining(), 0);
-
-        a.write(b"aaaa").unwrap();   // 4 bytes A→B
-        b.write(b"bbbbbb").unwrap(); // 6 bytes B→A
-        assert_eq!(a.outgoing_bytes_remaining(), 4);
-        assert_eq!(b.outgoing_bytes_remaining(), 6);
-
-        // B reads A's data — only A's outgoing drops
-        let mut buf = [0u8; 4];
-        b.read(&mut buf).unwrap();
-        assert_eq!(a.outgoing_bytes_remaining(), 0);
-        assert_eq!(b.outgoing_bytes_remaining(), 6); // unchanged
-    }
 }
