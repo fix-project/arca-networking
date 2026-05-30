@@ -1,120 +1,74 @@
 use arca_pipe::{BidirectionalPipe, PipeError, Read, Write};
-use crate::dataframe::{DataFrameHeader, FrameType};
 
 #[derive(Debug)]
 pub enum StreamError {
     WriteClosed,
-    ConnectionReset,
-    MessageTooLarge,
 }
 
 pub struct SyncStream<'a> {
     pub conn_id: u32,
     pipe: BidirectionalPipe<'a>,
-    write_closed: bool,
-    read_closed: bool,
-    current_frame_remaining: u32,
 }
 
 impl<'a> SyncStream<'a> {
     pub fn from_pipe(conn_id: u32, pipe: BidirectionalPipe<'a>) -> Self {
-        Self { conn_id, pipe, write_closed: false, read_closed: false, current_frame_remaining: 0 }
+        Self { conn_id, pipe }
     }
 
+    /// Write all of `buf` into the pipe, spinning if the ring is full; returns `Err(WriteClosed)` if the peer closed their read side.
     pub fn send(&mut self, buf: &[u8]) -> Result<usize, StreamError> {
-        if self.write_closed {
+        if self.pipe.is_peer_read_closed() {
+            self.pipe.close_write();
             return Err(StreamError::WriteClosed);
         }
         if buf.is_empty() {
             return Ok(0);
         }
-        if buf.len() > u32::MAX as usize {
-            return Err(StreamError::MessageTooLarge);
-        }
-        write_all(&mut self.pipe, DataFrameHeader::new(FrameType::Data, buf.len() as u32).as_bytes());
         write_all(&mut self.pipe, buf);
         Ok(buf.len())
     }
 
+    /// Read exactly `buf.len()` bytes, spinning until full; returns `Ok(n < buf.len())` only on EOF when the peer closed their write side.
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, StreamError> {
-        if self.read_closed {
-            return Ok(0);
+        let n = read_exact(&mut self.pipe, buf);
+        if n < buf.len() {
+            self.pipe.close_read();
         }
-
-        if self.current_frame_remaining == 0 {
-            let mut header_bytes = [0u8; core::mem::size_of::<DataFrameHeader>()];
-            read_exact(&mut self.pipe, &mut header_bytes);
-            let frame_type = FrameType::from_u32(u32::from_le_bytes(header_bytes[0..4].try_into().unwrap()));
-            let payload_len = u32::from_le_bytes(header_bytes[4..8].try_into().unwrap());
-
-            match frame_type {
-                None => {
-                    self.read_closed = true;
-                    write_all(&mut self.pipe, DataFrameHeader::new(FrameType::Rst, 0).as_bytes());
-                    self.write_closed = true;
-                    return Err(StreamError::ConnectionReset);
-                }
-                Some(FrameType::Fin) => {
-                    self.read_closed = true;
-                    return Ok(0);
-                }
-                Some(FrameType::Rst) => {
-                    self.read_closed = true;
-                    self.write_closed = true;
-                    return Err(StreamError::ConnectionReset);
-                }
-                Some(FrameType::Data) => {
-                    self.current_frame_remaining = payload_len;
-                }
-            }
-        }
-
-        let to_read = (self.current_frame_remaining as usize).min(buf.len());
-        read_exact(&mut self.pipe, &mut buf[..to_read]);
-        self.current_frame_remaining -= to_read as u32;
-        Ok(to_read)
+        Ok(n)
     }
 
-    pub fn shutdown(&mut self) {
-        if self.write_closed {
-            return;
-        }
-        write_all(&mut self.pipe, DataFrameHeader::new(FrameType::Fin, 0).as_bytes());
-        self.write_closed = true;
+    pub fn close_write(&mut self) {
+        self.pipe.close_write();
     }
 
-    pub fn send_rst(&mut self) {
-        if !self.write_closed {
-            write_all(&mut self.pipe, DataFrameHeader::new(FrameType::Rst, 0).as_bytes());
-            self.write_closed = true;
-        }
-        self.read_closed = true;
+    pub fn close_read(&mut self) {
+        self.pipe.close_read();
     }
 
     pub fn is_closed(&self) -> bool {
-        self.write_closed && self.read_closed
+        self.pipe.is_closed()
     }
+}
 
-    /// True when both FINs have been exchanged and the other side has consumed
-    /// all outgoing bytes, meaning shared memory is safe to free.
-    pub fn ready_to_free(&self) -> bool {
-        self.is_closed() && self.pipe.outgoing_bytes_remaining() == 0
+fn read_exact(pipe: &mut arca_pipe::BidirectionalPipe, buf: &mut [u8]) -> usize {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match pipe.read(&mut buf[filled..]) {
+            Ok(n) => filled += n,
+            Err(PipeError::WouldBlock) => {
+                if pipe.is_peer_write_closed() {
+                    break;
+                }
+            }
+        }
     }
+    filled
 }
 
 fn write_all<W: Write>(pipe: &mut W, mut src: &[u8]) {
     while !src.is_empty() {
         match pipe.write(src) {
             Ok(n) => src = &src[n..],
-            Err(PipeError::WouldBlock) => {}
-        }
-    }
-}
-
-fn read_exact<R: Read>(pipe: &mut R, mut dst: &mut [u8]) {
-    while !dst.is_empty() {
-        match pipe.read(dst) {
-            Ok(n) => dst = &mut dst[n..],
             Err(PipeError::WouldBlock) => {}
         }
     }
@@ -130,7 +84,7 @@ mod tests {
 
     macro_rules! stream_pair {
         ($ring:expr, $mem:ident, $a:ident, $b:ident) => {
-            let mut $mem = Aligned([0u8; 2 * (16 + $ring)]);
+            let mut $mem = Aligned([0u8; BidirectionalPipe::required_size($ring as u64) as usize]);
             let region = unsafe {
                 SharedMemoryRegion::from_raw($mem.0.as_mut_ptr(), $mem.0.len() as u64)
             };
@@ -151,73 +105,60 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_sends_fin_to_peer() {
+    fn close_write_signals_eof_to_peer() {
         stream_pair!(64, mem, a, b);
-        a.shutdown();
+        a.close_write();
         let mut buf = [0u8; 8];
         assert_eq!(b.recv(&mut buf).unwrap(), 0);
         assert!(!b.is_closed());
     }
 
     #[test]
-    fn recv_rst_closes_both_sides() {
+    fn close_both_sides_blocks_peer_ops() {
         stream_pair!(64, mem, a, b);
-        b.send_rst();
-        assert!(b.is_closed());
+        b.close_write();
+        b.close_read();
+        // b has closed its own ends but a hasn't yet — pipe not fully closed
+        assert!(!b.is_closed());
         let mut buf = [0u8; 8];
-        assert!(matches!(a.recv(&mut buf), Err(StreamError::ConnectionReset)));
-        assert!(a.is_closed());
-    }
-
-    #[test]
-    fn send_after_shutdown_errors() {
-        stream_pair!(64, mem, a, _b);
-        a.shutdown();
+        // a sees EOF because b closed write, and WriteClosed because b closed read
+        assert_eq!(a.recv(&mut buf).unwrap(), 0);
         assert!(matches!(a.send(b"x"), Err(StreamError::WriteClosed)));
     }
 
     #[test]
-    fn recv_after_read_close_returns_zero() {
+    fn send_after_peer_closes_read_errors() {
         stream_pair!(64, mem, a, b);
-        a.shutdown();
-        let mut buf = [0u8; 8];
-        b.recv(&mut buf).unwrap(); // consumes FIN, sets read_closed
-        assert_eq!(b.recv(&mut buf).unwrap(), 0); // read_closed → immediate zero
+        b.close_read();
+        assert!(matches!(a.send(b"x"), Err(StreamError::WriteClosed)));
     }
 
     #[test]
-    fn is_closed_requires_both_sides() {
-        stream_pair!(128, mem, a, b);
-        assert!(!a.is_closed());
-        a.shutdown();
-        assert!(!a.is_closed()); // write_closed but read still open
+    fn recv_after_eof_returns_zero() {
+        stream_pair!(64, mem, a, b);
+        a.close_write();
         let mut buf = [0u8; 8];
         b.recv(&mut buf).unwrap();
-        b.shutdown();
-        a.recv(&mut buf).unwrap();
-        assert!(a.is_closed());
+        assert_eq!(b.recv(&mut buf).unwrap(), 0);
     }
 
     #[test]
-    fn recv_partial_read() {
+    fn recv_fills_exact_buffer_size() {
         stream_pair!(128, mem, a, b);
         assert_eq!(a.send(b"hello").unwrap(), 5);
-        let mut buf = [0u8; 3];
-        assert_eq!(b.recv(&mut buf).unwrap(), 3);
-        assert_eq!(&buf, b"hel");
-        let mut buf2 = [0u8; 3];
-        assert_eq!(b.recv(&mut buf2).unwrap(), 2);
-        assert_eq!(&buf2[..2], b"lo");
+        let mut buf = [0u8; 5];
+        assert_eq!(b.recv(&mut buf).unwrap(), 5);
+        assert_eq!(&buf, b"hello");
     }
 
     #[test]
-    fn ready_to_free_after_both_fins_exchanged() {
+    fn pipe_closed_after_both_sides_close() {
         stream_pair!(128, mem, a, b);
-        a.shutdown();
+        a.close_write();
         let mut buf = [0u8; 8];
-        b.recv(&mut buf).unwrap(); // B reads A's FIN, draining A's outgoing ring
-        b.shutdown();
-        a.recv(&mut buf).unwrap(); // A reads B's FIN
-        assert!(a.ready_to_free());
+        b.recv(&mut buf).unwrap();
+        b.close_write();
+        a.recv(&mut buf).unwrap();
+        assert!(a.is_closed());
     }
 }

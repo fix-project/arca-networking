@@ -21,6 +21,22 @@ impl<'a> RingProducer<'a> {
         let read  = self.header.read_cursor.load(Ordering::Acquire);
         write.wrapping_sub(read)
     }
+
+    /// Signal that this producer will write no more bytes.
+    pub fn close_writer(&self) {
+        self.header.writer_closed.store(true, Ordering::Release);
+    }
+
+    /// True if the consumer has closed its read end.
+    pub fn is_reader_closed(&self) -> bool {
+        self.header.reader_closed.load(Ordering::Acquire)
+    }
+
+    /// True when both ends of this ring are closed.
+    pub fn is_closed(&self) -> bool {
+        self.header.writer_closed.load(Ordering::Acquire)
+            && self.header.reader_closed.load(Ordering::Acquire)
+    }
 }
 
 impl<'a> traits::Write for RingProducer<'a> {
@@ -49,9 +65,12 @@ mod tests {
     use core::sync::atomic::AtomicU64;
 
     fn header() -> RingHeader {
+        use core::sync::atomic::AtomicBool;
         RingHeader {
             read_cursor: AtomicU64::new(0),
             write_cursor: AtomicU64::new(0),
+            writer_closed: AtomicBool::new(false),
+            reader_closed: AtomicBool::new(false),
         }
     }
 
